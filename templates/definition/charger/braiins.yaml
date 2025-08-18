@@ -1,0 +1,41 @@
+template: braiins
+products:
+- brand: Braiins
+  description:
+    generic: Braiins OS Bitcoin Miner
+params:
+- name: uri
+  description:
+    de: IP-Adresse oder Hostname
+    en: IP address or hostname
+  required: true
+  example: 192.168.1.40
+- name: user
+  description:
+    de: Benutzername
+    en: Username
+  default: root
+- name: password
+  description:
+    de: Passwort
+    en: Password
+  required: true
+  mask: true
+- name: maxPower
+  description:
+    de: Optionale Leistungsbegrenzung in Watt.
+    en: Optional power limit in watts.
+  help:
+    de: 0 = deaktiviert, nutzt Miner-Standard.
+    en: 0 = disabled, uses miner default.
+  type: int
+  default: 0
+  advanced: true
+render: |
+  type: braiins
+  uri: {{ .uri }}
+  user: {{ .user }}
+  password: {{ .password }}
+  {{- if .maxPower }}
+  maxPower: {{ .maxPower }}
+  {{- end }}

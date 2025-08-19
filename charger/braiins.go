@@ -16,7 +16,7 @@
 // For dynamic power control: Enable "Power Target" mode in Braiins OS tuner settings
 // Without Power Target: Only on/off control available
 // Native Go implementation for Braiins OS evcc integration
-// Version: 1.1.0
+// Version: 1.2.0
 // Tested with Braiins OS Public REST API
 // https://developer.braiins-os.com/latest/openapi.html
 

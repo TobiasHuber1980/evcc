@@ -13,11 +13,16 @@
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 // SOFTWARE.
 
-// For dynamic power control: Enable "Power Target" mode in Braiins OS tuner settings
-// Without Power Target: Only on/off control available
+// File: charger/braiins.go
 // Native Go implementation for Braiins OS evcc integration
-// Version: 1.2.0
-// Tested with Braiins OS Public REST API
+// 
+// REQUIREMENTS:
+// - Braiins OS with API enabled (default port 80)
+// - For dynamic power control: Enable "Power Target" mode in Braiins OS tuner settings
+// - Without Power Target: Only on/off control available
+//
+// Version: 1.3.0 (added configurable voltage support for international users)
+// Tested with real API v1.0.0
 // https://developer.braiins-os.com/latest/openapi.html
 
 package charger
@@ -47,6 +52,7 @@ type BraiinsOS struct {
 	defaultWatts       int
 	maxWatts           int
 	configMaxPower     int
+	voltage            float64 // Configurable grid voltage
 	powerTargetEnabled bool
 	powerTargetWarned  bool // To avoid spam warnings
 	log                *util.Logger
@@ -59,6 +65,7 @@ type BraiinsConfig struct {
 	Password string        `mapstructure:"password"`
 	Timeout  time.Duration `mapstructure:"timeout"`
 	MaxPower int           `mapstructure:"maxPower"` // Optional: User-defined power limit
+	Voltage  float64       `mapstructure:"voltage"`  // Configurable grid voltage
 }
 
 // Login request/response structures
@@ -139,13 +146,16 @@ func NewBraiinsFromConfig(other map[string]interface{}) (api.Charger, error) {
 	if cc.User == "" {
 		cc.User = "root"
 	}
+	if cc.Voltage == 0 {
+		cc.Voltage = 230.0 // Default: Europe standard
+	}
 
 	uri := fmt.Sprintf("http://%s", cc.URI)
-	return NewBraiins(uri, cc.User, cc.Password, cc.Timeout, cc.MaxPower)
+	return NewBraiins(uri, cc.User, cc.Password, cc.Timeout, cc.MaxPower, cc.Voltage)
 }
 
 // NewBraiins creates Braiins charger
-func NewBraiins(uri, user, password string, timeout time.Duration, maxPower int) (api.Charger, error) {
+func NewBraiins(uri, user, password string, timeout time.Duration, maxPower int, voltage float64) (api.Charger, error) {
 	log := util.NewLogger("braiins")
 
 	c := &BraiinsOS{
@@ -159,6 +169,7 @@ func NewBraiins(uri, user, password string, timeout time.Duration, maxPower int)
 		user:           user,
 		password:       password,
 		configMaxPower: maxPower,
+		voltage:        voltage,
 	}
 
 	c.Client.Timeout = timeout
@@ -181,13 +192,13 @@ func NewBraiins(uri, user, password string, timeout time.Duration, maxPower int)
 		c.powerTargetEnabled = false
 	}
 
-	// Log configuration summary
+	// Log configuration summary with voltage
 	effectiveMax := c.getEffectiveMaxPower()
 	if c.powerTargetEnabled {
-		c.log.INFO.Printf("Braiins miner ready at %s with power control (range: %d-%dW, max: %dW)", 
-			uri, c.minWatts, c.maxWatts, effectiveMax)
+		c.log.INFO.Printf("Braiins miner ready at %s with power control (range: %d-%dW, max: %dW, %.0fV)", 
+			uri, c.minWatts, c.maxWatts, effectiveMax, c.voltage)
 	} else {
-		c.log.INFO.Printf("Braiins miner ready at %s with on/off control", uri)
+		c.log.INFO.Printf("Braiins miner ready at %s with on/off control (%.0fV)", uri, c.voltage)
 	}
 
 	return c, nil
@@ -424,7 +435,7 @@ func (c *BraiinsOS) Enable(enable bool) error {
 	return nil
 }
 
-// MaxCurrent implements the api.Charger interface with power scaling
+// MaxCurrent implements the api.Charger interface with configurable voltage
 func (c *BraiinsOS) MaxCurrent(current int64) error {
 	if current == 0 {
 		return c.Enable(false) // Pause mining
@@ -453,14 +464,15 @@ func (c *BraiinsOS) MaxCurrent(current int64) error {
 		return c.Enable(false)
 	}
 
-	// Calculate desired power based on current amperage (assuming 230V)
-	powerRequest := float64(current) * 230.0
+	// Calculate desired power based on current amperage and configured voltage
+	powerRequest := float64(current) * c.voltage
 
 	// Apply power limits
 	targetPower := math.Max(float64(c.minWatts), powerRequest)
 	targetPower = math.Min(float64(effectiveMax), targetPower)
 
-	c.log.DEBUG.Printf("Requested %.1fA, setting power target to %.0fW", float64(current), targetPower)
+	c.log.DEBUG.Printf("Requested %.1fA at %.0fV, setting power target to %.0fW", 
+		float64(current), c.voltage, targetPower)
 
 	return c.setPowerTarget(int(targetPower))
 }
@@ -488,15 +500,15 @@ func (c *BraiinsOS) CurrentPower() (float64, error) {
 	return power, nil
 }
 
-// Currents implements the api.PhaseCurrents interface
+// Currents implements the api.PhaseCurrents interface with configurable voltage
 func (c *BraiinsOS) Currents() (float64, float64, float64, error) {
 	power, err := c.CurrentPower()
 	if err != nil {
 		return 0, 0, 0, err
 	}
 
-	// Assume single-phase on L1, 230V
-	current := power / 230
+	// Calculate current using configured voltage
+	current := power / c.voltage
 	return current, 0, 0, nil
 }
 

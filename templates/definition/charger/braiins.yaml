@@ -21,13 +21,23 @@ params:
     en: Password
   required: true
   mask: true
+- name: voltage
+  description:
+    de: Netzspannung in Volt
+    en: Grid voltage in volts
+  help:
+    de: Standard-Spannungen - Europa/Australien/Asien=230V, USA/Kanada=120V, Japan=100V
+    en: Common voltages - Europe/Australia/Asia=230V, USA/Canada=120V, Japan=100V
+  type: int
+  default: 230
+  advanced: true
 - name: maxPower
   description:
-    de: Optionale Leistungsbegrenzung in Watt.
-    en: Optional power limit in watts.
+    de: Maximale Leistung für evcc-Steuerung in Watt
+    en: Maximum power for evcc control in watts
   help:
-    de: 0 = deaktiviert, nutzt Miner-Standard.
-    en: 0 = disabled, uses miner default.
+    de: 0 = automatisch, nutzt Miner-Standard
+    en: 0 = automatic, uses miner default
   type: int
   default: 0
   advanced: true
@@ -36,6 +46,9 @@ render: |
   uri: {{ .uri }}
   user: {{ .user }}
   password: {{ .password }}
+  {{- if ne .voltage 230 }}
+  voltage: {{ .voltage }}
+  {{- end }}
   {{- if .maxPower }}
   maxPower: {{ .maxPower }}
   {{- end }}

@@ -21,7 +21,7 @@
 // - For dynamic power control: Enable "Power Target" mode in Braiins OS tuner settings
 // - Without Power Target: Only on/off control available
 //
-// Version: 1.3.0 (added configurable voltage support for international users)
+// Version: 1.3.1 (added configurable voltage support + code quality improvements)
 // Tested with real API v1.0.0
 // https://developer.braiins-os.com/latest/openapi.html
 
@@ -37,6 +37,12 @@ import (
 	"github.com/evcc-io/evcc/api"
 	"github.com/evcc-io/evcc/util"
 	"github.com/evcc-io/evcc/util/request"
+)
+
+// Miner status constants
+const (
+	MinerStatusMining = 2 // Mining active
+	MinerStatusPaused = 3 // Mining paused
 )
 
 // BraiinsOS charger implementation
@@ -248,13 +254,21 @@ func (c *BraiinsOS) login() error {
 	return nil
 }
 
-// authRequest makes an authenticated request
-func (c *BraiinsOS) authRequest(method, path string) (*http.Response, error) {
+// makeAuthRequest creates and executes an authenticated HTTP request
+func (c *BraiinsOS) makeAuthRequest(method, path string, body any) (*http.Response, error) {
 	if err := c.login(); err != nil {
 		return nil, err
 	}
 
-	req, err := request.New(method, c.uri+path, nil, request.JSONEncoding)
+	var req *http.Request
+	var err error
+	
+	if body != nil {
+		req, err = request.New(method, c.uri+path, request.MarshalJSON(body), request.JSONEncoding)
+	} else {
+		req, err = request.New(method, c.uri+path, nil, request.JSONEncoding)
+	}
+	
 	if err != nil {
 		return nil, fmt.Errorf("failed to create authenticated request: %w", err)
 	}
@@ -263,19 +277,21 @@ func (c *BraiinsOS) authRequest(method, path string) (*http.Response, error) {
 	return c.Do(req)
 }
 
+// authRequest makes an authenticated request without body
+func (c *BraiinsOS) authRequest(method, path string) (*http.Response, error) {
+	return c.makeAuthRequest(method, path, nil)
+}
+
 // authRequestWithBody makes an authenticated request with JSON body
 func (c *BraiinsOS) authRequestWithBody(method, path string, body any) (*http.Response, error) {
-	if err := c.login(); err != nil {
-		return nil, err
-	}
+	return c.makeAuthRequest(method, path, body)
+}
 
-	req, err := request.New(method, c.uri+path, request.MarshalJSON(body), request.JSONEncoding)
-	if err != nil {
-		return nil, fmt.Errorf("failed to create authenticated request with body: %w", err)
+// closeResponseBody safely closes response body with error logging
+func (c *BraiinsOS) closeResponseBody(resp *http.Response) {
+	if err := resp.Body.Close(); err != nil {
+		c.log.DEBUG.Printf("Failed to close response body: %v", err)
 	}
-
-	req.Header.Set("Authorization", c.token)
-	return c.Do(req)
 }
 
 // discoverConstraints gets miner power limits from API
@@ -284,10 +300,10 @@ func (c *BraiinsOS) discoverConstraints() error {
 	if err != nil {
 		return fmt.Errorf("constraints request failed: %w", err)
 	}
-	defer resp.Body.Close()
+	defer c.closeResponseBody(resp)
 
 	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("constraints request failed with status: %s", resp.Status)
+		return fmt.Errorf("constraints request failed: %s (HTTP %d)", resp.Status, resp.StatusCode)
 	}
 
 	var constraints ConfigConstraints
@@ -311,10 +327,10 @@ func (c *BraiinsOS) detectPowerTargetMode() error {
 	if err != nil {
 		return fmt.Errorf("performance mode request failed: %w", err)
 	}
-	defer resp.Body.Close()
+	defer c.closeResponseBody(resp)
 
 	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("performance mode request failed with status: %s", resp.Status)
+		return fmt.Errorf("performance mode request failed: %s (HTTP %d)", resp.Status, resp.StatusCode)
 	}
 
 	var mode PerformanceMode
@@ -352,10 +368,10 @@ func (c *BraiinsOS) getMinerStatus() (int, error) {
 	if err != nil {
 		return 0, fmt.Errorf("miner details request failed: %w", err)
 	}
-	defer resp.Body.Close()
+	defer c.closeResponseBody(resp)
 
 	if resp.StatusCode != http.StatusOK {
-		return 0, fmt.Errorf("miner details failed with status: %s", resp.Status)
+		return 0, fmt.Errorf("miner details failed: %s (HTTP %d)", resp.Status, resp.StatusCode)
 	}
 
 	var details MinerDetails
@@ -372,10 +388,10 @@ func (c *BraiinsOS) setPowerTarget(targetWatts int) error {
 	if err != nil {
 		return fmt.Errorf("set power target failed: %w", err)
 	}
-	defer resp.Body.Close()
+	defer c.closeResponseBody(resp)
 
 	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("set power target failed with status: %s", resp.Status)
+		return fmt.Errorf("set power target failed: %s (HTTP %d)", resp.Status, resp.StatusCode)
 	}
 
 	c.log.DEBUG.Printf("Power target set to %dW", targetWatts)
@@ -389,13 +405,11 @@ func (c *BraiinsOS) Status() (api.ChargeStatus, error) {
 		return api.StatusNone, err
 	}
 
-	// Status codes from API testing:
-	// 2 = Mining active
-	// 3 = Mining paused
+	// Use named constants for better readability
 	switch status {
-	case 2:
+	case MinerStatusMining:
 		return api.StatusC, nil // Mining active
-	case 3:
+	case MinerStatusPaused:
 		return api.StatusB, nil // Mining paused
 	default:
 		return api.StatusNone, nil // Unknown status
@@ -408,7 +422,7 @@ func (c *BraiinsOS) Enabled() (bool, error) {
 	if err != nil {
 		return false, err
 	}
-	return status == 2, nil
+	return status == MinerStatusMining, nil
 }
 
 // Enable implements the api.Charger interface
@@ -424,10 +438,10 @@ func (c *BraiinsOS) Enable(enable bool) error {
 	if err != nil {
 		return err
 	}
-	defer resp.Body.Close()
+	defer c.closeResponseBody(resp)
 
 	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("enable/disable failed with status: %s", resp.Status)
+		return fmt.Errorf("enable/disable failed: %s (HTTP %d)", resp.Status, resp.StatusCode)
 	}
 
 	c.log.DEBUG.Printf("Miner %s", action)
@@ -467,14 +481,14 @@ func (c *BraiinsOS) MaxCurrent(current int64) error {
 	// Calculate desired power based on current amperage and configured voltage
 	powerRequest := float64(current) * c.voltage
 
-	// Apply power limits
+	// Apply power limits with explicit rounding
 	targetPower := math.Max(float64(c.minWatts), powerRequest)
 	targetPower = math.Min(float64(effectiveMax), targetPower)
 
 	c.log.DEBUG.Printf("Requested %.1fA at %.0fV, setting power target to %.0fW", 
 		float64(current), c.voltage, targetPower)
 
-	return c.setPowerTarget(int(targetPower))
+	return c.setPowerTarget(int(math.Round(targetPower)))
 }
 
 // CurrentPower implements the api.Meter interface
@@ -483,10 +497,10 @@ func (c *BraiinsOS) CurrentPower() (float64, error) {
 	if err != nil {
 		return 0, fmt.Errorf("stats request failed: %w", err)
 	}
-	defer resp.Body.Close()
+	defer c.closeResponseBody(resp)
 
 	if resp.StatusCode != http.StatusOK {
-		return 0, fmt.Errorf("stats failed with status: %s", resp.Status)
+		return 0, fmt.Errorf("stats failed: %s (HTTP %d)", resp.Status, resp.StatusCode)
 	}
 
 	var stats MinerStats

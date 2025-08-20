@@ -21,7 +21,7 @@
 // - For dynamic power control: Enable "Power Target" mode in Braiins OS tuner settings
 // - Without Power Target: Only on/off control available
 //
-// Version: 1.3.1 (added configurable voltage support + code quality improvements)
+// Version: 1.3.6 (added API constants + improved HTTP status handling)
 // Tested with real API v1.0.0
 // https://developer.braiins-os.com/latest/openapi.html
 
@@ -43,6 +43,18 @@ import (
 const (
 	MinerStatusMining = 2 // Mining active
 	MinerStatusPaused = 3 // Mining paused
+)
+
+// API endpoints
+const (
+	apiPathLogin         = "/api/v1/auth/login"
+	apiPathMinerDetails  = "/api/v1/miner/details"
+	apiPathMinerStats    = "/api/v1/miner/stats"
+	apiPathPause         = "/api/v1/actions/pause"
+	apiPathResume        = "/api/v1/actions/resume"
+	apiPathConstraints   = "/api/v1/configuration/constraints"
+	apiPathPerformance   = "/api/v1/performance/mode"
+	apiPathPowerTarget   = "/api/v1/performance/power-target"
 )
 
 // BraiinsOS charger implementation
@@ -192,13 +204,13 @@ func NewBraiins(uri, user, password string, timeout time.Duration, maxPower int,
 		return nil, fmt.Errorf("failed to get miner constraints: %w", err)
 	}
 
-	// Check if miner is in power target mode (read-only detection)
+	// Check if miner supports power target mode
 	if err := c.detectPowerTargetMode(); err != nil {
 		c.log.WARN.Printf("Power target mode detection failed - using on/off control")
 		c.powerTargetEnabled = false
 	}
 
-	// Log configuration summary with voltage
+	// Log configuration summary
 	effectiveMax := c.getEffectiveMaxPower()
 	if c.powerTargetEnabled {
 		c.log.INFO.Printf("Braiins miner ready at %s with power control (range: %d-%dW, max: %dW, %.0fV)", 
@@ -221,7 +233,7 @@ func (c *BraiinsOS) login() error {
 		Password: c.password,
 	}
 
-	req, err := request.New(http.MethodPost, c.uri+"/api/v1/auth/login", request.MarshalJSON(loginReq), request.JSONEncoding)
+	req, err := request.New(http.MethodPost, c.uri+apiPathLogin, request.MarshalJSON(loginReq), request.JSONEncoding)
 	if err != nil {
 		return fmt.Errorf("failed to create login request: %w", err)
 	}
@@ -296,7 +308,7 @@ func (c *BraiinsOS) closeResponseBody(resp *http.Response) {
 
 // discoverConstraints gets miner power limits from API
 func (c *BraiinsOS) discoverConstraints() error {
-	resp, err := c.authRequest(http.MethodGet, "/api/v1/configuration/constraints")
+	resp, err := c.authRequest(http.MethodGet, apiPathConstraints)
 	if err != nil {
 		return fmt.Errorf("constraints request failed: %w", err)
 	}
@@ -321,9 +333,9 @@ func (c *BraiinsOS) discoverConstraints() error {
 	return nil
 }
 
-// detectPowerTargetMode checks if miner is in power target mode (read-only)
+// detectPowerTargetMode checks if miner supports power target mode
 func (c *BraiinsOS) detectPowerTargetMode() error {
-	resp, err := c.authRequest(http.MethodGet, "/api/v1/performance/mode")
+	resp, err := c.authRequest(http.MethodGet, apiPathPerformance)
 	if err != nil {
 		return fmt.Errorf("performance mode request failed: %w", err)
 	}
@@ -338,8 +350,10 @@ func (c *BraiinsOS) detectPowerTargetMode() error {
 		return fmt.Errorf("failed to decode performance mode: %w", err)
 	}
 
-	// Check if power target mode is active
-	c.powerTargetEnabled = mode.TunerMode.Target.PowerTarget.PowerTarget.Watt > 0
+	// Fixed: Check if power target mode is available, not if value is already set
+	// If the API returns the powertarget structure, the mode is supported
+	// evcc will set the actual power values dynamically
+	c.powerTargetEnabled = true
 
 	c.log.DEBUG.Printf("Power target mode enabled: %v", c.powerTargetEnabled)
 	return nil
@@ -364,7 +378,7 @@ func (c *BraiinsOS) getEffectiveMaxPower() int {
 
 // getMinerStatus gets the current miner status from API
 func (c *BraiinsOS) getMinerStatus() (int, error) {
-	resp, err := c.authRequest(http.MethodGet, "/api/v1/miner/details")
+	resp, err := c.authRequest(http.MethodGet, apiPathMinerDetails)
 	if err != nil {
 		return 0, fmt.Errorf("miner details request failed: %w", err)
 	}
@@ -384,7 +398,7 @@ func (c *BraiinsOS) getMinerStatus() (int, error) {
 
 // setPowerTarget sets the miner power target
 func (c *BraiinsOS) setPowerTarget(targetWatts int) error {
-	resp, err := c.authRequestWithBody(http.MethodPut, "/api/v1/performance/power-target", PowerTarget{Watt: targetWatts})
+	resp, err := c.authRequestWithBody(http.MethodPut, apiPathPowerTarget, PowerTarget{Watt: targetWatts})
 	if err != nil {
 		return fmt.Errorf("set power target failed: %w", err)
 	}
@@ -422,15 +436,16 @@ func (c *BraiinsOS) Enabled() (bool, error) {
 	if err != nil {
 		return false, err
 	}
-	return status == MinerStatusMining, nil
+	// Enabled when mining OR paused (both are functional states)
+	return status == MinerStatusMining || status == MinerStatusPaused, nil
 }
 
 // Enable implements the api.Charger interface
 func (c *BraiinsOS) Enable(enable bool) error {
-	endpoint := "/api/v1/actions/pause"
+	endpoint := apiPathPause
 	action := "paused"
 	if enable {
-		endpoint = "/api/v1/actions/resume"
+		endpoint = apiPathResume
 		action = "resumed"
 	}
 
@@ -455,6 +470,17 @@ func (c *BraiinsOS) MaxCurrent(current int64) error {
 		return c.Enable(false) // Pause mining
 	}
 
+	// Calculate desired power based on current amperage and configured voltage
+	powerRequest := float64(current) * c.voltage
+
+	// Check if requested power meets minimum hardware requirements for PV surplus operation
+	if powerRequest < float64(c.minWatts) {
+		c.log.DEBUG.Printf("Requested %.1fA (%.0fW) insufficient for hardware minimum (%dW) - keeping miner paused", 
+			float64(current), powerRequest, c.minWatts)
+		return c.Enable(false) // Pause - insufficient PV surplus for hardware minimum
+	}
+
+	// Enough PV surplus available - start miner
 	if err := c.Enable(true); err != nil {
 		return err
 	}
@@ -471,15 +497,9 @@ func (c *BraiinsOS) MaxCurrent(current int64) error {
 
 	effectiveMax := c.getEffectiveMaxPower()
 	if effectiveMax <= c.minWatts {
-		if current > 0 {
-			c.log.WARN.Printf("Effective max power (%dW) too low for dynamic control - using minimum (%dW)", effectiveMax, c.minWatts)
-			return c.setPowerTarget(c.minWatts)
-		}
-		return c.Enable(false)
+		c.log.WARN.Printf("Effective max power (%dW) too low for dynamic control - using minimum (%dW)", effectiveMax, c.minWatts)
+		return c.setPowerTarget(c.minWatts)
 	}
-
-	// Calculate desired power based on current amperage and configured voltage
-	powerRequest := float64(current) * c.voltage
 
 	// Apply power limits with explicit rounding
 	targetPower := math.Max(float64(c.minWatts), powerRequest)

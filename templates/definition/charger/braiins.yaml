@@ -2,7 +2,7 @@ template: braiins
 products:
 - brand: Braiins
   description:
-    generic: Braiins OS Bitcoin Miner
+    generic: Bitcoin Miner
 params:
 - name: uri
   description:
@@ -28,7 +28,7 @@ params:
   help:
     de: Standard-Spannungen - Europa/Australien/Asien=230V, USA/Kanada=120V, Japan=100V
     en: Common voltages - Europe/Australia/Asia=230V, USA/Canada=120V, Japan=100V
-  type: int
+  type: float
   default: 230
   advanced: true
 - name: maxPower
@@ -46,7 +46,7 @@ render: |
   uri: {{ .uri }}
   user: {{ .user }}
   password: {{ .password }}
-  {{- if ne .voltage 230 }}
+  {{- if ne (atoi .voltage) 230 }}
   voltage: {{ .voltage }}
   {{- end }}
   {{- if .maxPower }}

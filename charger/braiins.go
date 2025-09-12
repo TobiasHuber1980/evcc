@@ -5,6 +5,17 @@
 // - Also enable DPS-Mode if needed
 // Version: 1.8.4 (Fixed stepSize >= effectiveMax mathematical impossibility)
 // Version: 1.8.5 (Added FIX 1: Rounding Logic Bug - KRITISCH)
+// Version: 1.9.0 (Complete rewrite with MinCurrent interface)
+// Version: 1.9.1 (Intelligent hardware minimum auto-adjustment for seamless UX)
+// Version: 1.9.2 (ChargerEx interface for precise decimal ampere control - no more rounding)
+// Version: 1.9.3 (Fixed negative DPS step calculation & improved rate limiting feedback)
+// Version: 1.9.4 (Fixed race conditions, locking inconsistencies & improved numerical precision)
+// Version: 1.9.5 (Fixed logging order, consistent rounding logic & improved power target detection)
+// Version: 1.9.6 (Fixed PowerTarget edge case & eliminated redundant rounding operations)
+// Version: 1.9.7 (chore Cleaned up)
+// Version: 1.9.8 (CRITICAL FIX: PowerTarget detection from real miner config instead of unreliable constraints defaults)
+// Version: 1.9.9 (DPS cooperation: WARN → INFO for normal operation)
+// Version: 1.9.10 (Optimized log levels - no false warnings during normal operation)
 
 package charger
 
@@ -24,17 +35,15 @@ import (
 	"github.com/evcc-io/evcc/util/request"
 )
 
-// Miner status constants from OpenAPI specification
 const (
-	MinerStatusUnspecified = 0 // Unspecified status
-	MinerStatusIdle        = 1 // Miner is idle
-	MinerStatusMining      = 2 // Miner is mining
-	MinerStatusPaused      = 3 // Miner is paused
-	MinerStatusDegraded    = 4 // Miner performance is degraded
-	MinerStatusError       = 5 // Miner is in error state
+	MinerStatusUnspecified = 0
+	MinerStatusIdle        = 1
+	MinerStatusMining      = 2
+	MinerStatusPaused      = 3
+	MinerStatusDegraded    = 4
+	MinerStatusError       = 5
 )
 
-// API endpoints
 const (
 	apiPathLogin         = "/api/v1/auth/login"
 	apiPathMinerDetails  = "/api/v1/miner/details"
@@ -47,7 +56,6 @@ const (
 	apiPathNetworkConfig = "/api/v1/network/configuration"
 )
 
-// BraiinsOS charger implementation
 type BraiinsOS struct {
 	*request.Helper
 	*embed
@@ -58,26 +66,21 @@ type BraiinsOS struct {
 	voltage        float64
 	minerName      string
 
-	// Configurable rate limiting and stepping parameters
 	powerTargetInterval time.Duration
 	powerTargetStep     int
 
-	// Hardware constraints discovered from miner
 	minWatts     int
 	defaultWatts int
 	maxWatts     int
 
-	// Power target capability and warning state
 	powerTargetEnabled bool
 	powerTargetWarned  bool
 
-	// Simple DPS detection and status
-	dpsDetected   bool // DPS hardware support detected
-	dpsActive     bool // DPS currently enabled
-	dpsMinTarget  int  // DPS minimum from constraints
-	dpsActiveStep int  // DPS step from active config
+	dpsDetected   bool
+	dpsActive     bool
+	dpsMinTarget  int
+	dpsActiveStep int
 
-	// Thread-safe fields protected by mutex
 	mu              sync.Mutex
 	token           string
 	tokenExpiry     time.Time
@@ -87,7 +90,6 @@ type BraiinsOS struct {
 	log *util.Logger
 }
 
-// BraiinsConfig is the configuration struct
 type BraiinsConfig struct {
 	URI                 string        `mapstructure:"uri"`
 	User                string        `mapstructure:"user"`
@@ -99,7 +101,6 @@ type BraiinsConfig struct {
 	PowerTargetStep     int           `mapstructure:"powerTargetStep"`
 }
 
-// Login request/response structures
 type LoginRequest struct {
 	Username string `json:"username"`
 	Password string `json:"password"`
@@ -110,12 +111,10 @@ type LoginResponse struct {
 	TimeoutS int    `json:"timeout_s"`
 }
 
-// MinerDetails for status detection
 type MinerDetails struct {
 	Status int `json:"status"`
 }
 
-// MinerStats for power measurement
 type MinerStats struct {
 	PowerStats struct {
 		ApproximatedConsumption struct {
@@ -124,18 +123,15 @@ type MinerStats struct {
 	} `json:"power_stats"`
 }
 
-// PowerTarget structures
 type PowerTarget struct {
 	Watt int `json:"watt"`
 }
 
-// NetworkConfiguration for hostname discovery
 type NetworkConfiguration struct {
 	Hostname string                 `json:"hostname"`
 	Protocol map[string]interface{} `json:"protocol,omitempty"`
 }
 
-// MinerConfiguration for DPS status detection
 type MinerConfiguration struct {
 	Dps struct {
 		Enabled   bool `json:"enabled"`
@@ -156,7 +152,6 @@ type MinerConfiguration struct {
 	} `json:"tuner"`
 }
 
-// ConfigConstraints for power limits and DPS detection
 type ConfigConstraints struct {
 	TunerConstraints struct {
 		PowerTarget struct {
@@ -170,6 +165,9 @@ type ConfigConstraints struct {
 				Watt int `json:"watt"`
 			} `json:"max"`
 		} `json:"power_target"`
+		Enabled struct {
+			Default bool `json:"default"`
+		} `json:"enabled"`
 	} `json:"tuner_constraints"`
 
 	DpsConstraints struct {
@@ -209,7 +207,6 @@ func NewBraiinsFromConfig(other map[string]interface{}) (api.Charger, error) {
 		return nil, err
 	}
 
-	// Set defaults for missing configuration values
 	if cc.Timeout == 0 {
 		cc.Timeout = 15 * time.Second
 	}
@@ -269,6 +266,7 @@ func (c *BraiinsOS) determineMinerName() string {
 	return "unknown"
 }
 
+// NewBraiins creates a new Braiins charger instance
 func NewBraiins(uri, user, password string, timeout time.Duration, maxPower int, voltage float64, powerTargetInterval time.Duration, powerTargetStep int) (api.Charger, error) {
 	log := util.NewLogger("braiins")
 
@@ -291,32 +289,47 @@ func NewBraiins(uri, user, password string, timeout time.Duration, maxPower int,
 
 	c.Client.Timeout = timeout
 
-	// Test connection and get initial token
+	c.minerName = c.determineMinerName()
+	c.log.INFO.Printf("%s: Connecting to Braiins miner at %s", c.minerName, uri)
+
 	if err := c.login(); err != nil {
 		return nil, fmt.Errorf("connection test failed: %w", err)
 	}
 
-	// Determine miner name for logging
-	c.minerName = c.determineMinerName()
-	c.log.INFO.Printf("%s: Braiins miner connected at %s", c.minerName, uri)
+	c.log.INFO.Printf("%s: Braiins miner connected successfully", c.minerName)
 
-	// Discover miner constraints and DPS detection
 	if err := c.discoverConstraints(); err != nil {
 		return nil, fmt.Errorf("failed to get miner constraints: %w", err)
 	}
 
-	// Discover actual DPS status
-	if err := c.discoverDpsStatus(); err != nil {
-		return nil, fmt.Errorf("failed to get DPS status: %w", err)
+	if err := c.discoverMinerStatus(); err != nil {
+		return nil, fmt.Errorf("failed to get miner status: %w", err)
 	}
 
-	// Validate configuration
 	if c.configMaxPower > 0 && c.configMaxPower < c.minWatts {
 		return nil, fmt.Errorf("configured maxPower (%dW) below hardware minimum (%dW)", c.configMaxPower, c.minWatts)
 	}
 
-	// Log configuration summary
 	effectiveMax := c.getEffectiveMaxPower()
+	if effectiveMax <= c.minWatts {
+		c.log.WARN.Printf("%s: Effective max power (%dW) too low - using minimum (%dW)",
+			c.minerName, effectiveMax, c.minWatts)
+		if err := c.setPowerTarget(c.minWatts); err != nil {
+			return c, err
+		}
+		return c, c.Enable(true)
+	}
+
+	// Display configuration summary
+	c.displayConfigurationSummary()
+
+	return c, nil
+}
+
+// displayConfigurationSummary shows miner capabilities and control mode
+func (c *BraiinsOS) displayConfigurationSummary() {
+	effectiveMax := c.getEffectiveMaxPower()
+
 	if c.powerTargetEnabled {
 		var maxLabel string
 		if c.configMaxPower > 0 {
@@ -345,8 +358,6 @@ func NewBraiins(uri, user, password string, timeout time.Duration, maxPower int,
 				return ""
 			}())
 	}
-
-	return c, nil
 }
 
 // login gets a new authentication token with thread-safe token management
@@ -355,7 +366,7 @@ func (c *BraiinsOS) login() error {
 	defer c.mu.Unlock()
 
 	if time.Now().Before(c.tokenExpiry) && c.token != "" {
-		return nil // Token still valid
+		return nil
 	}
 
 	loginReq := LoginRequest{
@@ -415,11 +426,14 @@ func (c *BraiinsOS) authRequest(method, path string, body any) (*http.Response, 
 		token := c.token
 		c.mu.Unlock()
 
+		if token == "" {
+			return nil, fmt.Errorf("no token available after login")
+		}
+
 		req.Header.Set("Authorization", token)
 		return c.Do(req)
 	}
 
-	// Try once, retry on 401
 	for retry := 0; retry < 2; retry++ {
 		resp, err := doRequest()
 		if err != nil {
@@ -435,7 +449,7 @@ func (c *BraiinsOS) authRequest(method, path string, body any) (*http.Response, 
 			c.tokenExpiry = time.Time{}
 			c.mu.Unlock()
 
-			continue // Retry
+			continue
 		}
 
 		return resp, nil
@@ -450,7 +464,7 @@ func (c *BraiinsOS) handleHTTPResponse(resp *http.Response, operation string) er
 		return fmt.Errorf("authentication failed after retry: %s (HTTP %d)", resp.Status, resp.StatusCode)
 	}
 	if resp.StatusCode == http.StatusNoContent {
-		return nil // 204 No Content is success for PUT operations
+		return nil
 	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		return fmt.Errorf("%s failed: %s (HTTP %d)", operation, resp.Status, resp.StatusCode)
@@ -467,7 +481,7 @@ func (c *BraiinsOS) closeResponseBody(resp *http.Response) {
 	}
 }
 
-// discoverConstraints gets miner power limits and detects DPS support
+// discoverConstraints gets miner power limits and detects DPS hardware support
 func (c *BraiinsOS) discoverConstraints() error {
 	resp, err := c.authRequest(http.MethodGet, apiPathConstraints, nil)
 	if err != nil {
@@ -484,15 +498,10 @@ func (c *BraiinsOS) discoverConstraints() error {
 		return fmt.Errorf("failed to decode constraints: %w", err)
 	}
 
-	// Hardware constraints
 	c.minWatts = constraints.TunerConstraints.PowerTarget.Min.Watt
 	c.defaultWatts = constraints.TunerConstraints.PowerTarget.Default.Watt
 	c.maxWatts = constraints.TunerConstraints.PowerTarget.Max.Watt
 
-	// Power target support detection
-	c.powerTargetEnabled = c.minWatts > 0 && c.defaultWatts > 0 && c.maxWatts > 0
-
-	// Simple DPS detection
 	dpsStep := constraints.DpsConstraints.PowerStep.Default.Watt
 	dpsMinTarget := constraints.DpsConstraints.MinPowerTarget.Default.Watt
 	c.dpsDetected = dpsStep > 0 && dpsMinTarget > 0
@@ -502,44 +511,56 @@ func (c *BraiinsOS) discoverConstraints() error {
 		c.log.INFO.Printf("%s: DPS hardware detected: min=%dW, step=%dW", c.minerName, dpsMinTarget, dpsStep)
 	}
 
-	c.log.DEBUG.Printf("%s: Constraints - min=%dW, default=%dW, max=%dW, powerTarget=%v, dps=%v",
-		c.minerName, c.minWatts, c.defaultWatts, c.maxWatts, c.powerTargetEnabled, c.dpsDetected)
+	c.log.DEBUG.Printf("%s: Hardware constraints - min=%dW, default=%dW, max=%dW, dps=%v",
+		c.minerName, c.minWatts, c.defaultWatts, c.maxWatts, c.dpsDetected)
 
 	return nil
 }
 
-// discoverDpsStatus checks if DPS is actually active
-func (c *BraiinsOS) discoverDpsStatus() error {
-	if !c.dpsDetected {
-		return nil // Skip if no DPS hardware
-	}
-
+// discoverMinerStatus checks actual PowerTarget and DPS status from real configuration
+func (c *BraiinsOS) discoverMinerStatus() error {
 	resp, err := c.authRequest(http.MethodGet, apiPathMinerConfig, nil)
 	if err != nil {
-		c.log.WARN.Printf("%s: Could not check DPS status: %v", c.minerName, err)
-		return nil // Non-fatal
+		return fmt.Errorf("miner config request failed: %w", err)
 	}
 	defer c.closeResponseBody(resp)
 
 	if err := c.handleHTTPResponse(resp, "miner config request"); err != nil {
-		c.log.WARN.Printf("%s: Miner config request failed: %v", c.minerName, err)
-		return nil // Non-fatal
+		return err
 	}
 
 	var config MinerConfiguration
 	if err := json.NewDecoder(resp.Body).Decode(&config); err != nil {
-		c.log.WARN.Printf("%s: Could not decode miner config: %v", c.minerName, err)
-		return nil // Non-fatal
+		return fmt.Errorf("failed to decode miner config: %w", err)
 	}
+
+	c.powerTargetEnabled = config.Tuner.Enabled && c.maxWatts > 0
 
 	c.dpsActive = config.Dps.Enabled
 	c.dpsActiveStep = config.Dps.PowerStep.Watt
 
-	if c.dpsActive {
-		c.log.INFO.Printf("%s: DPS is active - evcc will cooperate with DPS control", c.minerName)
-		c.log.INFO.Printf("%s: DPS configuration: step=%dW, mode=%d", c.minerName, c.dpsActiveStep, config.Dps.Mode)
+	if c.powerTargetEnabled {
+		currentTarget := "not set"
+		if config.Tuner.PowerTarget != nil {
+			currentTarget = fmt.Sprintf("%dW", config.Tuner.PowerTarget.Watt)
+		}
+		c.log.INFO.Printf("%s: PowerTarget ENABLED - current: %s, mode: %d",
+			c.minerName, currentTarget, config.Tuner.TunerMode)
 	} else {
-		c.log.INFO.Printf("%s: DPS available but inactive - evcc has full control", c.minerName)
+		if !config.Tuner.Enabled {
+			c.log.INFO.Printf("%s: PowerTarget DISABLED - tuner not enabled", c.minerName)
+		} else if c.maxWatts <= 0 {
+			c.log.INFO.Printf("%s: PowerTarget DISABLED - invalid hardware limits", c.minerName)
+		}
+	}
+
+	if c.dpsDetected {
+		if c.dpsActive {
+			c.log.INFO.Printf("%s: DPS ACTIVE - evcc will cooperate with DPS control", c.minerName)
+			c.log.INFO.Printf("%s: DPS configuration: step=%dW, mode=%d", c.minerName, c.dpsActiveStep, config.Dps.Mode)
+		} else {
+			c.log.INFO.Printf("%s: DPS available but INACTIVE - evcc has full control", c.minerName)
+		}
 	}
 
 	return nil
@@ -552,8 +573,12 @@ func (c *BraiinsOS) getEffectiveMaxPower() int {
 		effectiveMax = c.configMaxPower
 	}
 
-	effectiveMax = int(math.Min(float64(effectiveMax), float64(c.maxWatts)))
-	effectiveMax = int(math.Max(float64(effectiveMax), float64(c.minWatts)))
+	if effectiveMax > c.maxWatts {
+		effectiveMax = c.maxWatts
+	}
+	if effectiveMax < c.minWatts {
+		effectiveMax = c.minWatts
+	}
 
 	return effectiveMax
 }
@@ -588,10 +613,8 @@ func (c *BraiinsOS) setPowerTarget(targetWatts int) error {
 	}
 	defer c.closeResponseBody(resp)
 
-	// Enhanced error handling for DPS conflicts
 	switch resp.StatusCode {
 	case http.StatusForbidden:
-		// Read limited error body for debugging
 		if resp.Body != nil {
 			body, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
 			if len(body) > 0 {
@@ -612,7 +635,6 @@ func (c *BraiinsOS) setPowerTarget(targetWatts int) error {
 		return err
 	}
 
-	// Update tracking
 	c.mu.Lock()
 	c.lastPowerTarget = targetWatts
 	c.lastPowerUpdate = time.Now()
@@ -620,189 +642,6 @@ func (c *BraiinsOS) setPowerTarget(targetWatts int) error {
 
 	c.log.INFO.Printf("%s: Power target set successfully: %dW", c.minerName, targetWatts)
 	return nil
-}
-
-// Status implements the api.Charger interface
-func (c *BraiinsOS) Status() (api.ChargeStatus, error) {
-	status, err := c.getMinerStatus()
-	if err != nil {
-		return api.StatusNone, err
-	}
-
-	switch status {
-	case MinerStatusMining:
-		return api.StatusC, nil
-	case MinerStatusPaused:
-		return api.StatusB, nil
-	case MinerStatusIdle:
-		return api.StatusA, nil
-	case MinerStatusDegraded:
-		return api.StatusC, nil // Still mining
-	case MinerStatusError:
-		return api.StatusNone, nil
-	default:
-		return api.StatusNone, nil
-	}
-}
-
-// Enabled implements the api.Charger interface
-func (c *BraiinsOS) Enabled() (bool, error) {
-	status, err := c.getMinerStatus()
-	if err != nil {
-		return false, err
-	}
-	return status == MinerStatusMining || status == MinerStatusDegraded, nil
-}
-
-// Enable implements the api.Charger interface
-func (c *BraiinsOS) Enable(enable bool) error {
-	endpoint := apiPathPause
-	operation := "pause"
-	if enable {
-		endpoint = apiPathResume
-		operation = "resume"
-	}
-
-	resp, err := c.authRequest(http.MethodPut, endpoint, nil)
-	if err != nil {
-		return err
-	}
-	defer c.closeResponseBody(resp)
-
-	if err := c.handleHTTPResponse(resp, operation); err != nil {
-		return err
-	}
-
-	c.log.DEBUG.Printf("%s: Miner %s successful", c.minerName, operation)
-	return nil
-}
-
-// MaxCurrent implements the api.Charger interface - WITH BOTH FIXES
-func (c *BraiinsOS) MaxCurrent(current int64) error {
-	c.log.INFO.Printf("%s: MaxCurrent called with %dA", c.minerName, current)
-
-	// Validate input
-	if current < 0 {
-		return fmt.Errorf("invalid negative current value: %d", current)
-	}
-
-	if current == 0 {
-		c.log.DEBUG.Printf("%s: Current=0A - pausing miner", c.minerName)
-		return c.Enable(false)
-	}
-
-	// Calculate desired power
-	powerRequest := float64(current) * c.voltage
-	c.log.INFO.Printf("%s: Requested %.1fA at %.0fV = %.0fW power", c.minerName, float64(current), c.voltage, powerRequest)
-
-	// Check minimum hardware requirements
-	if powerRequest < float64(c.minWatts) {
-		c.log.INFO.Printf("%s: Requested %.0fW insufficient for hardware minimum (%dW) - pausing miner", c.minerName, powerRequest, c.minWatts)
-		return c.Enable(false)
-	}
-
-	// FALL 1: Power target mode not available - simple on/off
-	if !c.powerTargetEnabled {
-		c.log.DEBUG.Printf("%s: Power target mode not available - using simple on/off control", c.minerName)
-		if !c.powerTargetWarned {
-			c.log.WARN.Printf("%s: Enable Power Target in Braiins OS for dynamic power control", c.minerName)
-			c.powerTargetWarned = true
-		}
-		return c.Enable(true)
-	}
-
-	effectiveMax := c.getEffectiveMaxPower()
-	if effectiveMax <= c.minWatts {
-		c.log.WARN.Printf("%s: Effective max power (%dW) too low - using minimum (%dW)", c.minerName, effectiveMax, c.minWatts)
-		if err := c.setPowerTarget(c.minWatts); err != nil {
-			return err
-		}
-		return c.Enable(true)
-	}
-
-	var targetPower float64
-	var stepSize int
-	var minLimit int
-
-	// FALL 2 & 3: Power target available - choose logic based on DPS status
-	if c.dpsActive {
-		// FALL 3: DPS ACTIVE - use DPS constraints
-		c.log.INFO.Printf("%s: DPS is active - using DPS constraints", c.minerName)
-		minLimit = c.dpsMinTarget
-		stepSize = c.dpsActiveStep
-		if stepSize <= 0 {
-			stepSize = 100 // fallback
-		}
-		if minLimit <= 0 {
-			minLimit = c.minWatts
-		}
-	} else {
-		// FALL 2: DPS NOT ACTIVE - evcc has full control (like v1.4.2)
-		c.log.INFO.Printf("%s: DPS inactive - evcc has full control", c.minerName)
-		minLimit = c.minWatts
-		stepSize = c.powerTargetStep
-	}
-
-	// FIX: Mathematical impossibility check - prevent stepSize >= effectiveMax
-	if stepSize >= effectiveMax {
-		c.log.INFO.Printf("%s: Step size (%dW) >= max power (%dW) - using 1W steps for precise control",
-			c.minerName, stepSize, effectiveMax)
-		stepSize = 1
-	}
-
-	// Apply power limits - EXACTLY like v1.4.2
-	targetPower = math.Max(float64(minLimit), powerRequest)
-	targetPower = math.Min(float64(effectiveMax), targetPower)
-
-	// Round down using step size
-	targetPower = math.Floor(targetPower/float64(stepSize)) * float64(stepSize)
-	targetPowerInt := int(targetPower)
-
-	// FIX 1: Ensure rounding doesn't drop below minLimit (critical bug fix)
-	if targetPowerInt < minLimit {
-		targetPowerInt = minLimit // Never go below hardware minimum
-		c.log.DEBUG.Printf("%s: Rounded power (%dW) below minimum, clamped to %dW", c.minerName, int(targetPower), minLimit)
-	}
-
-	c.log.INFO.Printf("%s: Power calculation: %.0fW -> %dW (min: %dW, step: %dW, %s)",
-		c.minerName, powerRequest, targetPowerInt, minLimit, stepSize,
-		func() string {
-			if c.dpsActive {
-				return "DPS mode"
-			}
-			return "evcc mode"
-		}())
-
-	// Rate limiting - EXACTLY like v1.4.2
-	c.mu.Lock()
-	timeSinceLastUpdate := time.Since(c.lastPowerUpdate)
-	powerChange := targetPowerInt != c.lastPowerTarget
-	lastTarget := c.lastPowerTarget
-	c.mu.Unlock()
-
-	if !powerChange {
-		c.log.DEBUG.Printf("%s: Power target unchanged at %dW, skipping update", c.minerName, lastTarget)
-		return nil
-	}
-
-	if timeSinceLastUpdate < c.powerTargetInterval {
-		c.log.DEBUG.Printf("%s: Rate limiting: %.0fs since last update, delaying power change to %dW",
-			c.minerName, timeSinceLastUpdate.Seconds(), targetPowerInt)
-		return nil
-	}
-
-	// FIX 2: Don't enable miner if target is 0W (critical bug fix)
-	if targetPowerInt == 0 {
-		c.log.DEBUG.Printf("%s: Power target is 0W - pausing miner instead of enabling", c.minerName)
-		return c.Enable(false)
-	}
-
-	// Set power target and enable
-	if err := c.setPowerTarget(targetPowerInt); err != nil {
-		return err
-	}
-
-	return c.Enable(true)
 }
 
 // CurrentPower implements the api.Meter interface
@@ -843,7 +682,227 @@ func (c *BraiinsOS) Currents() (float64, float64, float64, error) {
 	return current, 0, 0, nil
 }
 
-// Interface compliance checks
+// Status implements the api.Charger interface
+func (c *BraiinsOS) Status() (api.ChargeStatus, error) {
+	status, err := c.getMinerStatus()
+	if err != nil {
+		return api.StatusNone, err
+	}
+
+	switch status {
+	case MinerStatusMining:
+		return api.StatusC, nil
+	case MinerStatusPaused:
+		return api.StatusB, nil
+	case MinerStatusIdle:
+		return api.StatusA, nil
+	case MinerStatusDegraded:
+		return api.StatusC, nil
+	case MinerStatusError:
+		return api.StatusNone, nil
+	default:
+		return api.StatusNone, nil
+	}
+}
+
+// Enabled implements the api.Charger interface
+func (c *BraiinsOS) Enabled() (bool, error) {
+	status, err := c.getMinerStatus()
+	if err != nil {
+		return false, err
+	}
+	return status == MinerStatusMining || status == MinerStatusDegraded, nil
+}
+
+// Enable implements the api.Charger interface
+func (c *BraiinsOS) Enable(enable bool) error {
+	endpoint := apiPathPause
+	operation := "pause"
+	if enable {
+		endpoint = apiPathResume
+		operation = "resume"
+	}
+
+	resp, err := c.authRequest(http.MethodPut, endpoint, nil)
+	if err != nil {
+		return err
+	}
+	defer c.closeResponseBody(resp)
+
+	if err := c.handleHTTPResponse(resp, operation); err != nil {
+		return err
+	}
+
+	c.log.DEBUG.Printf("%s: Miner %s successful", c.minerName, operation)
+	return nil
+}
+
+// getMinCurrent returns the minimum current based on hardware or DPS constraints
+func (c *BraiinsOS) getMinCurrent() float64 {
+	voltage := c.voltage
+	if voltage <= 0 {
+		c.log.WARN.Printf("%s: Invalid voltage %.2f, using 230V default", c.minerName, c.voltage)
+		voltage = 230.0
+	}
+
+	minWatts := c.minWatts
+	if c.dpsActive && c.dpsMinTarget > 0 {
+		minWatts = c.dpsMinTarget
+		c.log.DEBUG.Printf("%s: Using DPS minimum: %dW", c.minerName, minWatts)
+	} else {
+		c.log.DEBUG.Printf("%s: Using hardware minimum: %dW", c.minerName, minWatts)
+	}
+
+	minAmps := float64(minWatts) / voltage
+
+	c.log.DEBUG.Printf("%s: MinCurrent = %.2fA (%dW at %.0fV)",
+		c.minerName, minAmps, minWatts, voltage)
+
+	return minAmps
+}
+
+// MaxCurrent implements the api.Charger interface - compatibility wrapper
+func (c *BraiinsOS) MaxCurrent(current int64) error {
+	return c.MaxCurrentMillis(float64(current))
+}
+
+// MaxCurrentMillis implements precise decimal ampere control
+func (c *BraiinsOS) MaxCurrentMillis(current float64) error {
+	c.log.INFO.Printf("%s: MaxCurrentMillis called with %.2fA", c.minerName, current)
+
+	if current < 0 {
+		return fmt.Errorf("invalid negative current value: %.2f", current)
+	}
+
+	if current == 0 {
+		c.log.DEBUG.Printf("%s: Current=0A - pausing miner", c.minerName)
+		return c.Enable(false)
+	}
+
+	minCurrent := c.getMinCurrent()
+	originalCurrent := current
+
+	if current < minCurrent {
+		c.log.INFO.Printf("%s: Auto-adjusting %.2fA → %.2fA (hardware minimum)",
+			c.minerName, current, minCurrent)
+		current = minCurrent
+	}
+
+	powerRequest := current * c.voltage
+	c.log.INFO.Printf("%s: Processing %.2fA at %.0fV = %.0fW power %s",
+		c.minerName, current, c.voltage, powerRequest,
+		func() string {
+			if current != originalCurrent {
+				return fmt.Sprintf("(adjusted from %.2fA)", originalCurrent)
+			}
+			return ""
+		}())
+
+	if !c.powerTargetEnabled {
+		c.log.DEBUG.Printf("%s: Power target mode not available - using simple on/off control", c.minerName)
+		if !c.powerTargetWarned {
+			c.log.INFO.Printf("%s: Using on/off control (PowerTarget not available)", c.minerName)
+			c.powerTargetWarned = true
+		}
+		return c.Enable(true)
+	}
+
+	if c.dpsActive {
+		c.log.INFO.Printf("%s: DPS is active - evcc will cooperate with DPS control", c.minerName)
+
+		dpsMinimum := c.dpsMinTarget
+		if dpsMinimum <= 0 {
+			dpsMinimum = c.minWatts
+		}
+
+		dpsStep := c.dpsActiveStep
+		if dpsStep <= 0 {
+			dpsStep = 300
+		}
+
+		var targetPower int
+		requestInt := int(math.Round(powerRequest))
+
+		if requestInt <= dpsMinimum {
+			targetPower = dpsMinimum
+		} else {
+			stepsNeeded := int(math.Ceil(float64(requestInt-dpsMinimum) / float64(dpsStep)))
+			targetPower = dpsMinimum + stepsNeeded*dpsStep
+		}
+
+		effectiveMax := c.getEffectiveMaxPower()
+		if targetPower > effectiveMax {
+			targetPower = effectiveMax
+		}
+
+		c.log.INFO.Printf("%s: DPS mode - using power target %dW (requested %.0fW, step: %dW)",
+			c.minerName, targetPower, powerRequest, dpsStep)
+
+		if err := c.setPowerTarget(targetPower); err != nil {
+			c.log.WARN.Printf("%s: Power target blocked by DPS: %v", c.minerName, err)
+			c.log.WARN.Printf("%s: Falling back to simple enable - DPS will control power", c.minerName)
+		}
+		return c.Enable(true)
+	}
+
+	effectiveMax := c.getEffectiveMaxPower()
+	stepSize := c.powerTargetStep
+	minLimit := c.minWatts
+
+	if stepSize >= effectiveMax {
+		c.log.INFO.Printf("%s: Step size (%dW) >= max power (%dW) - using 1W steps for precise control",
+			c.minerName, stepSize, effectiveMax)
+		stepSize = 1
+	}
+
+	limitedPower := math.Max(float64(minLimit), powerRequest)
+	limitedPower = math.Min(float64(effectiveMax), limitedPower)
+
+	steps := int(math.Ceil(limitedPower / float64(stepSize)))
+	targetPowerInt := steps * stepSize
+
+	if targetPowerInt > effectiveMax {
+		targetPowerInt = effectiveMax
+	}
+
+	if targetPowerInt < minLimit {
+		targetPowerInt = minLimit
+	}
+
+	c.log.INFO.Printf("%s: Power calculation: %.0fW → %dW (min: %dW, step: %dW, evcc mode)",
+		c.minerName, powerRequest, targetPowerInt, minLimit, stepSize)
+
+	c.mu.Lock()
+	timeSinceLastUpdate := time.Since(c.lastPowerUpdate)
+	powerChange := targetPowerInt != c.lastPowerTarget
+	lastTarget := c.lastPowerTarget
+	c.mu.Unlock()
+
+	if !powerChange {
+		c.log.DEBUG.Printf("%s: Power target unchanged at %dW, skipping update", c.minerName, lastTarget)
+		return nil
+	}
+
+	if timeSinceLastUpdate < c.powerTargetInterval {
+		waitTime := c.powerTargetInterval - timeSinceLastUpdate
+		c.log.INFO.Printf("%s: Rate limiting active, waiting %.1fs before setting %dW target",
+			c.minerName, waitTime.Seconds(), targetPowerInt)
+		time.Sleep(waitTime)
+	}
+
+	if targetPowerInt == 0 {
+		c.log.DEBUG.Printf("%s: Power target is 0W - pausing miner instead of enabling", c.minerName)
+		return c.Enable(false)
+	}
+
+	if err := c.setPowerTarget(targetPowerInt); err != nil {
+		return err
+	}
+
+	return c.Enable(true)
+}
+
 var _ api.Charger = (*BraiinsOS)(nil)
+var _ api.ChargerEx = (*BraiinsOS)(nil)
 var _ api.Meter = (*BraiinsOS)(nil)
 var _ api.PhaseCurrents = (*BraiinsOS)(nil)

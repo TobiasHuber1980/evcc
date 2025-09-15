@@ -16,6 +16,7 @@
 // Version: 1.9.8 (CRITICAL FIX: PowerTarget detection from real miner config instead of unreliable constraints defaults)
 // Version: 1.9.9 (DPS cooperation: WARN → INFO for normal operation)
 // Version: 1.9.10 (Optimized log levels - no false warnings during normal operation)
+// Version: 1.9.13 (Simplified rate limiting, 15s default interval, improved DPS rounding logic)
 
 package charger
 
@@ -217,7 +218,7 @@ func NewBraiinsFromConfig(other map[string]interface{}) (api.Charger, error) {
 		cc.Voltage = 230.0
 	}
 	if cc.PowerTargetInterval == 0 {
-		cc.PowerTargetInterval = 30 * time.Second
+		cc.PowerTargetInterval = 15 * time.Second
 	}
 	if cc.PowerTargetStep == 0 {
 		cc.PowerTargetStep = 100
@@ -826,7 +827,11 @@ func (c *BraiinsOS) MaxCurrentMillis(current float64) error {
 		if requestInt <= dpsMinimum {
 			targetPower = dpsMinimum
 		} else {
-			stepsNeeded := int(math.Ceil(float64(requestInt-dpsMinimum) / float64(dpsStep)))
+			// FIXED: Use math.Round instead of math.Ceil for better DPS cooperation
+			stepsNeeded := int(math.Round(float64(requestInt-dpsMinimum) / float64(dpsStep)))
+			if stepsNeeded < 0 {
+				stepsNeeded = 0
+			}
 			targetPower = dpsMinimum + stepsNeeded*dpsStep
 		}
 
@@ -883,6 +888,7 @@ func (c *BraiinsOS) MaxCurrentMillis(current float64) error {
 		return nil
 	}
 
+	// Simplified rate limiting - back to clean v1.9.10 logic
 	if timeSinceLastUpdate < c.powerTargetInterval {
 		waitTime := c.powerTargetInterval - timeSinceLastUpdate
 		c.log.INFO.Printf("%s: Rate limiting active, waiting %.1fs before setting %dW target",

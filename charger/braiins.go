@@ -16,7 +16,10 @@
 // Version: 1.9.8 (CRITICAL FIX: PowerTarget detection from real miner config instead of unreliable constraints defaults)
 // Version: 1.9.9 (DPS cooperation: WARN → INFO for normal operation)
 // Version: 1.9.10 (Optimized log levels - no false warnings during normal operation)
-// Version: 1.9.13 (Simplified rate limiting, 15s default interval, improved DPS rounding logic)
+// Version: 1.9.11 (Improved PowerTargetInterval for better short-interval compatibility)
+// Version: 1.9.12 (Enhanced rate limiting with 10s threshold for optimal evcc responsiveness)
+// Version: 1.9.14 (FIXED: math.Round for DPS + V1.9.12 rate limiting + no evcc restart regression)
+// Version: 1.9.15 (Added LoadpointController for automatic session management)
 
 package charger
 
@@ -32,6 +35,7 @@ import (
 	"time"
 
 	"github.com/evcc-io/evcc/api"
+	"github.com/evcc-io/evcc/core/loadpoint"
 	"github.com/evcc-io/evcc/util"
 	"github.com/evcc-io/evcc/util/request"
 )
@@ -88,6 +92,7 @@ type BraiinsOS struct {
 	lastPowerUpdate time.Time
 	lastPowerTarget int
 
+	lp  loadpoint.API
 	log *util.Logger
 }
 
@@ -685,6 +690,11 @@ func (c *BraiinsOS) Currents() (float64, float64, float64, error) {
 
 // Status implements the api.Charger interface
 func (c *BraiinsOS) Status() (api.ChargeStatus, error) {
+	// Check loadpoint mode - if Off, end session immediately
+	if c.lp != nil && c.lp.GetMode() == api.ModeOff {
+		return api.StatusA, nil
+	}
+
 	status, err := c.getMinerStatus()
 	if err != nil {
 		return api.StatusNone, err
@@ -888,12 +898,17 @@ func (c *BraiinsOS) MaxCurrentMillis(current float64) error {
 		return nil
 	}
 
-	// Simplified rate limiting - back to clean v1.9.10 logic
-	if timeSinceLastUpdate < c.powerTargetInterval {
+	// Enhanced rate limiting: disabled for short intervals to improve evcc compatibility
+	if c.powerTargetInterval > 10*time.Second && timeSinceLastUpdate < c.powerTargetInterval {
+		// Apply rate limiting only for longer intervals to prevent API overload
 		waitTime := c.powerTargetInterval - timeSinceLastUpdate
 		c.log.INFO.Printf("%s: Rate limiting active, waiting %.1fs before setting %dW target",
 			c.minerName, waitTime.Seconds(), targetPowerInt)
 		time.Sleep(waitTime)
+	} else if c.powerTargetInterval <= 10*time.Second {
+		// Skip rate limiting for short intervals to maximize responsiveness
+		c.log.DEBUG.Printf("%s: Short interval (%.1fs) - rate limiting disabled for responsiveness",
+			c.minerName, c.powerTargetInterval.Seconds())
 	}
 
 	if targetPowerInt == 0 {
@@ -908,7 +923,13 @@ func (c *BraiinsOS) MaxCurrentMillis(current float64) error {
 	return c.Enable(true)
 }
 
+// LoadpointControl implements loadpoint.Controller
+func (c *BraiinsOS) LoadpointControl(lp loadpoint.API) {
+	c.lp = lp
+}
+
 var _ api.Charger = (*BraiinsOS)(nil)
 var _ api.ChargerEx = (*BraiinsOS)(nil)
 var _ api.Meter = (*BraiinsOS)(nil)
 var _ api.PhaseCurrents = (*BraiinsOS)(nil)
+var _ loadpoint.Controller = (*BraiinsOS)(nil)

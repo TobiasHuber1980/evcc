@@ -96,22 +96,22 @@ type BraiinsOS struct {
 	lastPowerUpdate time.Time
 	lastPowerTarget int
 
-	lp        loadpoint.API
+	lp         loadpoint.API
 	energyFunc func() (float64, error)
-	log       *util.Logger
+	log        *util.Logger
 }
 
 type BraiinsConfig struct {
-	embed                   `mapstructure:",squash"`
-	URI                     string        `mapstructure:"uri"`
-	User                    string        `mapstructure:"user"`
-	Password                string        `mapstructure:"password"`
-	Timeout                 time.Duration `mapstructure:"timeout"`
-	MaxPower                int           `mapstructure:"maxPower"`
-	Voltage                 float64       `mapstructure:"voltage"`
-	PowerTargetInterval     time.Duration `mapstructure:"powerTargetInterval"`
-	PowerTargetStep         int           `mapstructure:"powerTargetStep"`
-	measurement.Energy      `mapstructure:",squash"`
+	embed               `mapstructure:",squash"`
+	URI                 string        `mapstructure:"uri"`
+	User                string        `mapstructure:"user"`
+	Password            string        `mapstructure:"password"`
+	Timeout             time.Duration `mapstructure:"timeout"`
+	MaxPower            int           `mapstructure:"maxPower"`
+	Voltage             float64       `mapstructure:"voltage"`
+	PowerTargetInterval time.Duration `mapstructure:"powerTargetInterval"`
+	PowerTargetStep     int           `mapstructure:"powerTargetStep"`
+	measurement.Energy  `mapstructure:",squash"`
 }
 
 type LoginRequest struct {
@@ -244,7 +244,7 @@ func NewBraiinsFromConfig(ctx context.Context, other map[string]interface{}) (ap
 	}
 
 	uri := ensureScheme(cc.URI)
-	
+
 	res, err := NewBraiins(uri, cc.User, cc.Password, cc.Timeout, cc.MaxPower, cc.Voltage, cc.PowerTargetInterval, cc.PowerTargetStep, &cc.embed)
 	if err != nil {
 		return nil, err
@@ -727,7 +727,7 @@ func (c *BraiinsOS) Status() (api.ChargeStatus, error) {
 	case MinerStatusPaused:
 		return api.StatusB, nil
 	case MinerStatusIdle:
-		return api.StatusB, nil  // FIXED: StatusB instead of StatusA for proper session tracking
+		return api.StatusB, nil // FIXED: StatusB instead of StatusA for proper session tracking
 	case MinerStatusDegraded:
 		return api.StatusC, nil
 	case MinerStatusError:

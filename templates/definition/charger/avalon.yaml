@@ -1,0 +1,40 @@
+template: avalon
+products:
+  - brand: Avalon
+    description:
+      generic: Avalon Bitcoin Miner
+params:
+  - name: uri
+    description:
+      de: IP-Adresse oder Hostname
+      en: IP address or hostname
+    required: true
+    example: 192.168.1.100
+  - name: port
+    description:
+      de: CGMiner API Port
+      en: CGMiner API port
+    help:
+      de: Standard Port ist 4028
+      en: Default port is 4028
+    default: "4028"
+    advanced: true
+  - name: voltage
+    description:
+      de: Netzspannung in Volt
+      en: Grid voltage in volts
+    help:
+      de: Europa/Australien/Asien=230V, USA/Kanada=120V, Japan=100V
+      en: Common voltages - Europe/Australia/Asia=230V, USA/Canada=120V, Japan=100V
+    type: float
+    default: 230
+    advanced: true
+render: |
+  type: avalon
+  uri: {{ .uri }}
+  {{- if ne .port "4028" }}
+  port: {{ .port }}
+  {{- end }}
+  {{- if ne (printf "%.0f" .voltage) "230" }}
+  voltage: {{ .voltage }}
+  {{- end }}

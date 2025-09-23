@@ -20,10 +20,13 @@
 // Version: 1.9.12 (Enhanced rate limiting with 10s threshold for optimal evcc responsiveness)
 // Version: 1.9.14 (FIXED: math.Round for DPS + V1.9.12 rate limiting + no evcc restart regression)
 // Version: 1.9.15 (Added LoadpointController for automatic session management)
+// Version: 1.9.16 (Added Energy integration for proper session statistics and GUI reset)
+// Version: 1.9.17 (FIXED: Removed LoadpointController Status override for proper session tracking like Heatpump)
 
 package charger
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -35,6 +38,7 @@ import (
 	"time"
 
 	"github.com/evcc-io/evcc/api"
+	"github.com/evcc-io/evcc/charger/measurement"
 	"github.com/evcc-io/evcc/core/loadpoint"
 	"github.com/evcc-io/evcc/util"
 	"github.com/evcc-io/evcc/util/request"
@@ -92,19 +96,22 @@ type BraiinsOS struct {
 	lastPowerUpdate time.Time
 	lastPowerTarget int
 
-	lp  loadpoint.API
-	log *util.Logger
+	lp        loadpoint.API
+	energyFunc func() (float64, error)
+	log       *util.Logger
 }
 
 type BraiinsConfig struct {
-	URI                 string        `mapstructure:"uri"`
-	User                string        `mapstructure:"user"`
-	Password            string        `mapstructure:"password"`
-	Timeout             time.Duration `mapstructure:"timeout"`
-	MaxPower            int           `mapstructure:"maxPower"`
-	Voltage             float64       `mapstructure:"voltage"`
-	PowerTargetInterval time.Duration `mapstructure:"powerTargetInterval"`
-	PowerTargetStep     int           `mapstructure:"powerTargetStep"`
+	embed                   `mapstructure:",squash"`
+	URI                     string        `mapstructure:"uri"`
+	User                    string        `mapstructure:"user"`
+	Password                string        `mapstructure:"password"`
+	Timeout                 time.Duration `mapstructure:"timeout"`
+	MaxPower                int           `mapstructure:"maxPower"`
+	Voltage                 float64       `mapstructure:"voltage"`
+	PowerTargetInterval     time.Duration `mapstructure:"powerTargetInterval"`
+	PowerTargetStep         int           `mapstructure:"powerTargetStep"`
+	measurement.Energy      `mapstructure:",squash"`
 }
 
 type LoginRequest struct {
@@ -195,7 +202,7 @@ type ConfigConstraints struct {
 }
 
 func init() {
-	registry.Add("braiins", NewBraiinsFromConfig)
+	registry.AddCtx("braiins", NewBraiinsFromConfig)
 }
 
 // ensureScheme adds http:// if no scheme is present
@@ -207,12 +214,19 @@ func ensureScheme(u string) string {
 }
 
 // NewBraiinsFromConfig creates a Braiins charger from generic config
-func NewBraiinsFromConfig(other map[string]interface{}) (api.Charger, error) {
+func NewBraiinsFromConfig(ctx context.Context, other map[string]interface{}) (api.Charger, error) {
 	var cc BraiinsConfig
 	if err := util.DecodeOther(other, &cc); err != nil {
 		return nil, err
 	}
 
+	// Set defaults
+	if cc.embed.Icon_ == "" {
+		cc.embed.Icon_ = "generic"
+	}
+	if len(cc.embed.Features_) == 0 {
+		cc.embed.Features_ = []api.Feature{api.IntegratedDevice}
+	}
 	if cc.Timeout == 0 {
 		cc.Timeout = 15 * time.Second
 	}
@@ -230,7 +244,22 @@ func NewBraiinsFromConfig(other map[string]interface{}) (api.Charger, error) {
 	}
 
 	uri := ensureScheme(cc.URI)
-	return NewBraiins(uri, cc.User, cc.Password, cc.Timeout, cc.MaxPower, cc.Voltage, cc.PowerTargetInterval, cc.PowerTargetStep)
+	
+	res, err := NewBraiins(uri, cc.User, cc.Password, cc.Timeout, cc.MaxPower, cc.Voltage, cc.PowerTargetInterval, cc.PowerTargetStep, &cc.embed)
+	if err != nil {
+		return nil, err
+	}
+
+	// Configure Energy integration
+	_, energyG, err := cc.Energy.Configure(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	// Store energy function for TotalEnergy interface
+	res.energyFunc = energyG
+
+	return res, nil
 }
 
 // tryGetHostname attempts to discover hostname via network configuration API
@@ -273,15 +302,12 @@ func (c *BraiinsOS) determineMinerName() string {
 }
 
 // NewBraiins creates a new Braiins charger instance
-func NewBraiins(uri, user, password string, timeout time.Duration, maxPower int, voltage float64, powerTargetInterval time.Duration, powerTargetStep int) (api.Charger, error) {
+func NewBraiins(uri, user, password string, timeout time.Duration, maxPower int, voltage float64, powerTargetInterval time.Duration, powerTargetStep int, embed *embed) (*BraiinsOS, error) {
 	log := util.NewLogger("braiins")
 
 	c := &BraiinsOS{
-		Helper: request.NewHelper(log),
-		embed: &embed{
-			Icon_:     "generic",
-			Features_: []api.Feature{api.IntegratedDevice},
-		},
+		Helper:              request.NewHelper(log),
+		embed:               embed,
 		log:                 log,
 		uri:                 uri,
 		user:                user,
@@ -669,7 +695,7 @@ func (c *BraiinsOS) CurrentPower() (float64, error) {
 
 	power := float64(stats.PowerStats.ApproximatedConsumption.Watt)
 	c.log.DEBUG.Printf("%s: Current power consumption: %.0fW", c.minerName, power)
-	return power, nil
+	return power, err
 }
 
 // Currents implements the api.PhaseCurrents interface
@@ -688,13 +714,8 @@ func (c *BraiinsOS) Currents() (float64, float64, float64, error) {
 	return current, 0, 0, nil
 }
 
-// Status implements the api.Charger interface
+// Status implements the api.Charger interface - FIXED: No LoadpointController override
 func (c *BraiinsOS) Status() (api.ChargeStatus, error) {
-	// Check loadpoint mode - if Off, end session immediately
-	if c.lp != nil && c.lp.GetMode() == api.ModeOff {
-		return api.StatusA, nil
-	}
-
 	status, err := c.getMinerStatus()
 	if err != nil {
 		return api.StatusNone, err
@@ -706,7 +727,7 @@ func (c *BraiinsOS) Status() (api.ChargeStatus, error) {
 	case MinerStatusPaused:
 		return api.StatusB, nil
 	case MinerStatusIdle:
-		return api.StatusA, nil
+		return api.StatusB, nil  // FIXED: StatusB instead of StatusA for proper session tracking
 	case MinerStatusDegraded:
 		return api.StatusC, nil
 	case MinerStatusError:
@@ -923,6 +944,14 @@ func (c *BraiinsOS) MaxCurrentMillis(current float64) error {
 	return c.Enable(true)
 }
 
+// TotalEnergy implements the api.MeterEnergy interface
+func (c *BraiinsOS) TotalEnergy() (float64, error) {
+	if c.energyFunc != nil {
+		return c.energyFunc()
+	}
+	return 0, nil
+}
+
 // LoadpointControl implements loadpoint.Controller
 func (c *BraiinsOS) LoadpointControl(lp loadpoint.API) {
 	c.lp = lp
@@ -931,5 +960,6 @@ func (c *BraiinsOS) LoadpointControl(lp loadpoint.API) {
 var _ api.Charger = (*BraiinsOS)(nil)
 var _ api.ChargerEx = (*BraiinsOS)(nil)
 var _ api.Meter = (*BraiinsOS)(nil)
+var _ api.MeterEnergy = (*BraiinsOS)(nil)
 var _ api.PhaseCurrents = (*BraiinsOS)(nil)
 var _ loadpoint.Controller = (*BraiinsOS)(nil)

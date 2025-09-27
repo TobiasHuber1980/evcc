@@ -241,21 +241,28 @@ func (c *BraiinsOS) tryGetHostname() string {
 	return strings.TrimSuffix(config.Hostname, ".local")
 }
 
-// determineMinerName gets hostname from API, falls back to IP from URI
+// determineMinerName gets hostname from URI first as fallback
 func (c *BraiinsOS) determineMinerName() string {
-	if hostname := c.tryGetHostname(); hostname != "" {
-		return hostname
-	}
-
+	// Extract host from URI as reliable fallback
 	if parsed, err := url.Parse(c.uri); err == nil {
 		host := parsed.Host
 		if colonIndex := strings.Index(host, ":"); colonIndex != -1 {
 			host = host[:colonIndex]
 		}
-		return host
+		if host != "" {
+			return host
+		}
 	}
 
 	return "unknown"
+}
+
+// updateMinerNameAfterLogin attempts to get real hostname after login is established
+func (c *BraiinsOS) updateMinerNameAfterLogin() {
+	if hostname := c.tryGetHostname(); hostname != "" && hostname != c.minerName {
+		c.log.DEBUG.Printf("%s: Updated miner name to %s", c.minerName, hostname)
+		c.minerName = hostname
+	}
 }
 
 // NewBraiins creates a new Braiins charger instance
@@ -351,9 +358,9 @@ func (c *BraiinsOS) displayConfigurationSummary() {
 // login gets a new authentication token with thread-safe token management
 func (c *BraiinsOS) login() error {
 	c.mu.Lock()
-	defer c.mu.Unlock()
 
 	if time.Now().Before(c.tokenExpiry) && c.token != "" {
+		c.mu.Unlock()
 		return nil
 	}
 
@@ -364,15 +371,18 @@ func (c *BraiinsOS) login() error {
 
 	req, err := request.New(http.MethodPost, c.uri+apiPathLogin, request.MarshalJSON(loginReq), request.JSONEncoding)
 	if err != nil {
+		c.mu.Unlock()
 		return fmt.Errorf("failed to create login request: %w", err)
 	}
 
 	var resp LoginResponse
 	if err := c.DoJSON(req, &resp); err != nil {
+		c.mu.Unlock()
 		return fmt.Errorf("login request failed: %w", err)
 	}
 
 	if resp.Token == "" {
+		c.mu.Unlock()
 		return fmt.Errorf("no token received")
 	}
 
@@ -388,8 +398,21 @@ func (c *BraiinsOS) login() error {
 		c.tokenExpiry = time.Now().Add(tokenTimeout)
 	}
 
+	// Unlock mutex BEFORE tryUpdateHostname to avoid deadlock
+	c.mu.Unlock()
+
+	// Try to update hostname after successful login
+	c.tryUpdateHostname()
+
 	c.log.DEBUG.Printf("%s: Login successful, token expires in %s", c.minerName, tokenTimeout)
 	return nil
+}
+
+// tryUpdateHostname attempts to get real hostname after login without separate logging
+func (c *BraiinsOS) tryUpdateHostname() {
+	if hostname := c.tryGetHostname(); hostname != "" && hostname != c.minerName {
+		c.minerName = hostname
+	}
 }
 
 // authRequest makes an authenticated HTTP request with automatic retry on 401

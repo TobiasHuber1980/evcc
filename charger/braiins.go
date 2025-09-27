@@ -280,6 +280,8 @@ func NewBraiins(uri, user, password string, timeout time.Duration, maxPower int,
 	}
 
 	c.Client.Timeout = timeout
+
+	// Determine miner name before login to avoid "unknown" in logs
 	c.minerName = c.determineMinerName()
 
 	if err := c.login(); err != nil {

@@ -1,0 +1,87 @@
+template: braiins
+products:
+  - brand: Braiins
+    description:
+      generic: Bitcoin Miner
+params:
+  - name: uri
+    description:
+      de: IP-Adresse
+      en: IP address
+    required: true
+    example: 192.168.1.40
+  - name: user
+    description:
+      de: Benutzername
+      en: Username
+    default: root
+  - name: password
+    description:
+      de: Passwort
+      en: Password
+    required: true
+    mask: true
+  - name: maxPower
+    description:
+      de: Maximale Leistung des Miners in Watt
+      en: Maximum power for evcc control in watts
+    help:
+      de: "0 = automatisch (Miner-Standard)"
+      en: "0 = automatic (miner default)"
+    type: int
+    default: 0
+  - name: dailyReset
+    description:
+      de: Täglicher Session-Reset
+      en: Daily session reset
+    help:
+      de: Session-Reset täglich um 23:59 Uhr (setzt Energiezähler zurück)
+      en: Session reset daily at 23:59 (resets energy counter)
+    type: bool
+    default: true
+  - name: powerTargetInterval
+    description:
+      de: Intervall zwischen Leistungsänderungen
+      en: Minimum interval between power target updates
+    type: duration
+    default: 30s
+    advanced: true
+  - name: powerTargetStep
+    description:
+      de: Leistungsschritte in Watt
+      en: Power target stepping in watts
+    help:
+      de: "Granularität der Leistungsanpassung"
+      en: "Power adjustment granularity"
+    type: int
+    advanced: true
+  - name: voltage
+    description:
+      de: Netzspannung in Volt
+      en: Grid voltage in volts
+    help:
+      de: Europa/Australien/Asien=230V, USA/Kanada=120V, Japan=100V
+      en: Common voltages - Europe/Australia/Asia=230V, USA/Canada=120V, Japan=100V
+    type: float
+    default: 230
+    advanced: true
+render: |
+  type: braiins
+  uri: {{ .uri }}
+  user: {{ .user }}
+  password: {{ .password }}
+  {{- if .maxPower }}
+  maxPower: {{ .maxPower }}
+  {{- end }}
+  {{- if .dailyReset }}
+  dailyReset: {{ .dailyReset }}
+  {{- end }}
+  {{- if ne .powerTargetInterval "30s" }}
+  powerTargetInterval: {{ .powerTargetInterval }}
+  {{- end }}
+  {{- if .powerTargetStep }}
+  powerTargetStep: {{ .powerTargetStep }}
+  {{- end }}
+  {{- if ne (atoi .voltage) 230 }}
+  voltage: {{ .voltage }}
+  {{- end }}

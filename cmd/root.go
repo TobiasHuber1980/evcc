@@ -18,6 +18,7 @@ import (
 	"github.com/evcc-io/evcc/server"
 	"github.com/evcc-io/evcc/server/db"
 	"github.com/evcc-io/evcc/server/mcp"
+	"github.com/evcc-io/evcc/server/network"
 	"github.com/evcc-io/evcc/server/updater"
 	"github.com/evcc-io/evcc/util"
 	"github.com/evcc-io/evcc/util/auth"
@@ -157,6 +158,12 @@ func runRoot(cmd *cobra.Command, args []string) {
 		err = networkSettings(&conf.Network)
 	}
 
+	// configure plugin external url
+	if err == nil {
+		// network configuration complete, start dependent services like HomeAssistant discovery
+		network.Start(conf.Network)
+	}
+
 	// start broadcasting values
 	tee := new(util.Tee)
 	valueChan := make(chan util.Param, 64)
@@ -261,13 +268,15 @@ func runRoot(cmd *cobra.Command, args []string) {
 	}
 
 	// announce on mDNS
-	if err == nil && strings.HasSuffix(conf.Network.Host, ".local") {
-		err = configureMDNS(conf.Network)
+	if err == nil {
+		if err := configureMDNS(conf.Network); err != nil {
+			log.WARN.Println("mDNS:", err)
+		}
 	}
 
 	// start SHM server
 	if err == nil {
-		err = wrapErrorWithClass(ClassSHM, configureSHM(&conf.SHM, site, httpd))
+		err = wrapErrorWithClass(ClassSHM, configureSHM(&conf.SHM, conf.Network.ExternalURL(), site, httpd))
 	}
 
 	// start HEMS server

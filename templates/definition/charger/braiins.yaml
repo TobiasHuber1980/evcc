@@ -1,0 +1,142 @@
+template: braiins
+products:
+  - brand: Braiins
+    description:
+      de: Braiins Bitcoin Miner
+      en: Braiins Bitcoin Miner
+
+params:
+  - name: uri
+    description:
+      de: IP-Adresse oder Hostname
+      en: IP address or hostname
+    required: true
+    example: 192.168.1.40
+
+  - name: user
+    description:
+      de: Benutzername
+      en: Username
+    default: root
+
+  - name: password
+    description:
+      de: Passwort
+      en: Password
+    required: true
+    mask: true
+
+  - name: maxPower
+    description:
+      de: Maximale Leistung in Watt
+      en: Maximum power in watts
+    help:
+      de: "0 = Miner-Standard nutzen"
+      en: "0 = use miner default"
+    type: int
+    default: 0
+
+  - name: voltage
+    description:
+      de: Netzspannung in Volt
+      en: Grid voltage in volts
+    help:
+      de: Europa/Asien/Australien=230V, USA/Kanada=120V, Japan=100V
+      en: Europe/Asia/Australia=230V, USA/Canada=120V, Japan=100V
+    type: float
+    default: 230
+    advanced: true
+
+  - name: dailyReset
+    description:
+      de: Täglicher Session-Reset
+      en: Daily session reset
+    help:
+      de: Session-Reset täglich um 23:59 Uhr (setzt Energiezähler zurück)
+      en: Session reset daily at 23:59 (resets energy counter)
+    type: bool
+    default: true
+
+  - name: intelligentDecrease
+    description:
+      de: Intelligentes Runterregeln
+      en: Intelligent power decrease
+    help:
+      de: Wartet bei niedrigerer Leistung und regelt schrittweise runter (verhindert lange DPS-Recovery)
+      en: Waits on lower power and decreases gradually (prevents long DPS recovery)
+    type: bool
+    default: true
+
+  - name: powerTargetInterval
+    description:
+      de: Intervall zwischen Leistungserhöhungen
+      en: Interval between power increases
+    help:
+      de: Wartezeit zwischen Hochregeln-Schritten
+      en: Wait time between power increase steps
+    type: duration
+    default: 15s
+    advanced: true
+
+  - name: powerTargetStep
+    description:
+      de: Leistungsschritte in Watt
+      en: Power stepping in watts
+    help:
+      de: Granularität der Leistungsanpassung (100-300W empfohlen)
+      en: Power adjustment granularity (100-300W recommended)
+    type: int
+    default: 100
+    advanced: true
+
+  - name: minDecreaseDuration
+    description:
+      de: Wartezeit vor Runterregeln
+      en: Wait time before decreasing power
+    help:
+      de: Wie lange bei niedrigerer Anforderung warten bevor runtergeregelt wird (ignoriert kurze Wolken)
+      en: How long to wait at lower demand before decreasing (ignores short clouds)
+    type: duration
+    default: 15m
+    advanced: true
+
+  - name: decreaseStepInterval
+    description:
+      de: Wartezeit zwischen Runterregeln-Schritten
+      en: Wait time between power decrease steps
+    help:
+      de: Pause zwischen einzelnen 300W-Schritten beim Runterregeln
+      en: Pause between individual 300W steps when decreasing
+    type: duration
+    default: 5m
+    advanced: true
+
+render: |
+  type: braiins
+  uri: {{ .uri }}
+  user: {{ .user }}
+  password: {{ .password }}
+  {{- if .maxPower }}
+  maxPower: {{ .maxPower }}
+  {{- end }}
+  {{- if ne (atoi .voltage) 230 }}
+  voltage: {{ .voltage }}
+  {{- end }}
+  {{- if .dailyReset }}
+  dailyReset: {{ .dailyReset }}
+  {{- end }}
+  {{- if .intelligentDecrease }}
+  intelligentDecrease: {{ .intelligentDecrease }}
+  {{- end }}
+  {{- if ne .powerTargetInterval "15s" }}
+  powerTargetInterval: {{ .powerTargetInterval }}
+  {{- end }}
+  {{- if .powerTargetStep }}
+  powerTargetStep: {{ .powerTargetStep }}
+  {{- end }}
+  {{- if ne .minDecreaseDuration "15m" }}
+  minDecreaseDuration: {{ .minDecreaseDuration }}
+  {{- end }}
+  {{- if ne .decreaseStepInterval "5m" }}
+  decreaseStepInterval: {{ .decreaseStepInterval }}
+  {{- end }}

@@ -4,26 +4,16 @@
 // Without Power Target: Only on/off control available
 // Also enable DPS-Mode if needed
 // Version: 0.1
-
+//
 // LICENSE
 // Copyright (c) Tobias W. Huber https://github.com/TobiasHuber1980/
 // This module is NOT covered by the MIT license. All rights reserved.
-// The above copyright notice and this permission notice shall be included in all
-// copies or substantial portions of the Software.
-// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-// IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-// FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-// AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-// LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
-// OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
-// SOFTWARE.
 
 package charger
 
 import (
 	"encoding/json"
 	"fmt"
-	"io"
 	"math"
 	"net/http"
 	"net/url"
@@ -64,20 +54,16 @@ const (
 const (
 	defaultTimeout              = 15 * time.Second
 	defaultVoltage              = 230.0
-	defaultPowerTargetInterval  = 15 * time.Second
-	defaultPowerTargetStep      = 100
-	defaultMinDecreaseDuration  = 15 * time.Minute
-	defaultDecreaseStepInterval = 5 * time.Minute
-	defaultDPSStep              = 300
+	defaultPowerTargetStep      = 300
+	defaultMinDecreaseDuration  = 5 * time.Minute // Changed from 15min to 5min
+	defaultDecreaseStepInterval = 3 * time.Minute // Changed from 5min to 3min
 	defaultConsistencyChecks    = 5
 	defaultRecentRequestsLimit  = 10
 
-	lowPowerThreshold        = 0.85 // 85% of current target
-	requiredConsistencyRatio = 0.80 // 4 out of 5 checks
+	lowPowerThreshold        = 0.85
+	requiredConsistencyRatio = 0.80
 	tokenExpiryBufferSeconds = 30
 	defaultTokenTimeout      = 1 * time.Hour
-	maxResponseBodyBytes     = 512
-	minIntervalForWait       = 10 * time.Second
 )
 
 // Daily reset timing
@@ -91,45 +77,32 @@ type BraiinsOS struct {
 	*request.Helper
 	*embed
 
-	// Connection settings
 	uri      string
 	user     string
 	password string
 
-	// Configuration
-	config PowerControlConfig
-
-	// Hardware capabilities
+	config   PowerControlConfig
 	hardware HardwareCapabilities
 
-	// Power target state
-	powerState PowerTargetState
-
-	// DPS state
-	dps DPSState
-
-	// Intelligent decrease
+	powerState          PowerTargetState
+	dps                 DPSState
 	intelligentDecrease IntelligentDecreaseController
 
-	// Authentication
-	auth AuthState
-
-	// Session management
+	auth    AuthState
 	session SessionState
 
-	// External dependencies
-	lp  loadpoint.API
-	log *util.Logger
-	mu  sync.Mutex
+	lp          loadpoint.API
+	currentMode api.ChargeMode
+	log         *util.Logger
+	mu          sync.Mutex
 }
 
 // PowerControlConfig holds user configuration
 type PowerControlConfig struct {
-	MaxPower            int
-	Voltage             float64
-	PowerTargetInterval time.Duration
-	PowerTargetStep     int
-	DailyResetEnabled   bool
+	MaxPower          int
+	Voltage           float64
+	PowerTargetStep   int
+	DailyResetEnabled bool
 }
 
 // HardwareCapabilities represents miner hardware limits
@@ -142,10 +115,14 @@ type HardwareCapabilities struct {
 
 // PowerTargetState tracks power target status
 type PowerTargetState struct {
-	Enabled      bool
-	LastTarget   int
-	LastUpdate   time.Time
-	WarningShown bool
+	Enabled         bool
+	LastTarget      int
+	LastUpdate      time.Time
+	WarningShown    bool
+	IsPausing       bool
+	PauseStarted    time.Time
+	IsFromDiscovery bool
+	PausedByTimer   bool
 }
 
 // DPSState tracks Dynamic Power Scaling state
@@ -163,15 +140,17 @@ type IntelligentDecreaseController struct {
 	DecreaseStepInterval time.Duration
 	ConsistencyChecks    int
 
-	// State
 	LowPowerStart    time.Time
 	LastDecreaseStep time.Time
 
-	// Ring buffer for power requests (fixed size for efficiency)
+	LastTimer1LoggedMinute int
+	LastTimer2LoggedMinute int
+	LoggedFirstExpiry      bool
+
 	RecentRequests     [defaultRecentRequestsLimit]float64
 	RecentRequestTimes [defaultRecentRequestsLimit]time.Time
-	RequestIndex       int // Current write position
-	RequestCount       int // Number of valid entries (0-10)
+	RequestIndex       int
+	RequestCount       int
 }
 
 // AuthState manages authentication tokens
@@ -193,15 +172,14 @@ type BraiinsConfig struct {
 	Timeout              time.Duration `mapstructure:"timeout"`
 	MaxPower             int           `mapstructure:"maxPower"`
 	Voltage              float64       `mapstructure:"voltage"`
-	PowerTargetInterval  time.Duration `mapstructure:"powerTargetInterval"`
 	PowerTargetStep      int           `mapstructure:"powerTargetStep"`
+	PowerTargetInterval  time.Duration `mapstructure:"powerTargetInterval"`
 	DailyReset           bool          `mapstructure:"dailyReset"`
 	IntelligentDecrease  bool          `mapstructure:"intelligentDecrease"`
 	MinDecreaseDuration  time.Duration `mapstructure:"minDecreaseDuration"`
 	DecreaseStepInterval time.Duration `mapstructure:"decreaseStepInterval"`
 }
 
-// API request/response types
 type LoginRequest struct {
 	Username string `json:"username"`
 	Password string `json:"password"`
@@ -293,7 +271,6 @@ func init() {
 	registry.Add("braiins", NewBraiinsFromConfig)
 }
 
-// ensureScheme adds http:// prefix if no scheme is present
 func ensureScheme(u string) string {
 	if strings.HasPrefix(u, "http://") || strings.HasPrefix(u, "https://") {
 		return u
@@ -301,24 +278,19 @@ func ensureScheme(u string) string {
 	return "http://" + u
 }
 
-// NewBraiinsFromConfig creates a new Braiins instance from configuration
 func NewBraiinsFromConfig(other map[string]any) (api.Charger, error) {
 	cc := applyConfigDefaults(other)
-
 	uri := ensureScheme(cc.URI)
 	return NewBraiins(uri, cc.User, cc.Password, cc.Timeout, cc.MaxPower, cc.Voltage,
-		cc.PowerTargetInterval, cc.PowerTargetStep, cc.DailyReset,
+		cc.PowerTargetStep, cc.DailyReset,
 		cc.IntelligentDecrease, cc.MinDecreaseDuration, cc.DecreaseStepInterval)
 }
 
-// applyConfigDefaults applies default values to the configuration
 func applyConfigDefaults(other map[string]any) BraiinsConfig {
 	var cc BraiinsConfig
 	if err := util.DecodeOther(other, &cc); err != nil {
-		// Return empty config, will be caught by validation
 		return cc
 	}
-
 	if cc.Timeout == 0 {
 		cc.Timeout = defaultTimeout
 	}
@@ -327,9 +299,6 @@ func applyConfigDefaults(other map[string]any) BraiinsConfig {
 	}
 	if cc.Voltage == 0 {
 		cc.Voltage = defaultVoltage
-	}
-	if cc.PowerTargetInterval == 0 {
-		cc.PowerTargetInterval = defaultPowerTargetInterval
 	}
 	if cc.PowerTargetStep == 0 {
 		cc.PowerTargetStep = defaultPowerTargetStep
@@ -340,13 +309,11 @@ func applyConfigDefaults(other map[string]any) BraiinsConfig {
 	if cc.DecreaseStepInterval == 0 {
 		cc.DecreaseStepInterval = defaultDecreaseStepInterval
 	}
-
 	return cc
 }
 
-// NewBraiins creates a new Braiins OS charger instance
 func NewBraiins(uri, user, password string, timeout time.Duration, maxPower int, voltage float64,
-	powerTargetInterval time.Duration, powerTargetStep int, dailyReset bool,
+	powerTargetStep int, dailyReset bool,
 	intelligentDecrease bool, minDecreaseDuration time.Duration, decreaseStepInterval time.Duration) (api.Charger, error) {
 	log := util.NewLogger("braiins")
 
@@ -361,11 +328,10 @@ func NewBraiins(uri, user, password string, timeout time.Duration, maxPower int,
 		user:     user,
 		password: password,
 		config: PowerControlConfig{
-			MaxPower:            maxPower,
-			Voltage:             voltage,
-			PowerTargetInterval: powerTargetInterval,
-			PowerTargetStep:     powerTargetStep,
-			DailyResetEnabled:   dailyReset,
+			MaxPower:          maxPower,
+			Voltage:           voltage,
+			PowerTargetStep:   powerTargetStep,
+			DailyResetEnabled: dailyReset,
 		},
 		hardware: HardwareCapabilities{
 			Name: "unknown",
@@ -390,35 +356,28 @@ func NewBraiins(uri, user, password string, timeout time.Duration, maxPower int,
 	return c, nil
 }
 
-// initialize performs initial setup and validation
 func (c *BraiinsOS) initialize() error {
 	if err := c.login(); err != nil {
 		return fmt.Errorf("connection test failed: %w", err)
 	}
-
 	if err := c.discoverConstraints(); err != nil {
 		return fmt.Errorf("failed to get miner constraints: %w", err)
 	}
-
 	if err := c.discoverMinerStatus(); err != nil {
 		return fmt.Errorf("failed to get miner status: %w", err)
 	}
-
 	if err := c.validateConfiguration(); err != nil {
 		return err
 	}
-
 	c.displayConfigurationSummary()
 	return nil
 }
 
-// validateConfiguration checks if configuration is valid for hardware
 func (c *BraiinsOS) validateConfiguration() error {
 	if c.config.MaxPower > 0 && c.config.MaxPower < c.hardware.MinWatts {
 		return fmt.Errorf("configured maxPower (%dW) below hardware minimum (%dW)",
 			c.config.MaxPower, c.hardware.MinWatts)
 	}
-
 	effectiveMax := c.getEffectiveMaxPower()
 	if effectiveMax <= c.hardware.MinWatts {
 		c.log.WARN.Printf("%s: Effective max power (%dW) too low - using minimum (%dW)",
@@ -428,30 +387,24 @@ func (c *BraiinsOS) validateConfiguration() error {
 		}
 		return c.Enable(true)
 	}
-
 	return nil
 }
 
-// determineMinerName extracts hostname from URI
 func (c *BraiinsOS) determineMinerName() string {
 	parsed, err := url.Parse(c.uri)
 	if err != nil {
 		return "unknown"
 	}
-
 	host := parsed.Host
 	if colonIndex := strings.Index(host, ":"); colonIndex != -1 {
 		host = host[:colonIndex]
 	}
-
 	if host != "" {
 		return host
 	}
-
 	return "unknown"
 }
 
-// tryGetHostname attempts to retrieve the miner's configured hostname
 func (c *BraiinsOS) tryGetHostname() string {
 	resp, err := c.authRequest(http.MethodGet, apiPathNetworkConfig, nil)
 	if err != nil {
@@ -459,38 +412,30 @@ func (c *BraiinsOS) tryGetHostname() string {
 		return ""
 	}
 	defer c.closeResponseBody(resp)
-
 	if resp.StatusCode != http.StatusOK {
 		return ""
 	}
-
 	var config NetworkConfiguration
 	if err := json.NewDecoder(resp.Body).Decode(&config); err != nil {
 		return ""
 	}
-
 	return strings.TrimSuffix(config.Hostname, ".local")
 }
 
-// tryUpdateHostname updates miner name if hostname is available
 func (c *BraiinsOS) tryUpdateHostname() {
 	hostname := c.tryGetHostname()
 	if hostname == "" || hostname == c.hardware.Name {
 		return
 	}
-
 	c.mu.Lock()
 	c.hardware.Name = hostname
 	c.mu.Unlock()
 }
 
-// displayConfigurationSummary logs the current configuration
 func (c *BraiinsOS) displayConfigurationSummary() {
 	effectiveMax := c.getEffectiveMaxPower()
-
 	c.log.INFO.Printf("%s: Hardware: %dW (min) - %dW (default) - %dW (max)",
 		c.hardware.Name, c.hardware.MinWatts, c.hardware.DefaultWatts, c.hardware.MaxWatts)
-
 	if c.powerState.Enabled {
 		c.logPowerTargetConfiguration(effectiveMax)
 	} else {
@@ -498,47 +443,40 @@ func (c *BraiinsOS) displayConfigurationSummary() {
 	}
 }
 
-// logPowerTargetConfiguration logs configuration when power target is enabled
 func (c *BraiinsOS) logPowerTargetConfiguration(effectiveMax int) {
 	currentTarget := c.hardware.DefaultWatts
 	if c.powerState.LastTarget > 0 {
 		currentTarget = c.powerState.LastTarget
 	}
 	c.log.INFO.Printf("%s: PowerTarget ENABLED - current: %dW", c.hardware.Name, currentTarget)
-
 	c.logDPSStatus()
 	c.logMaxPowerSource(effectiveMax)
 	c.logIntelligentDecreaseStatus()
 }
 
-// logDPSStatus logs DPS configuration status
 func (c *BraiinsOS) logDPSStatus() {
 	if c.dps.Active {
-		c.log.INFO.Printf("%s: DPS ACTIVE: %dW (min) - %dW (step)",
-			c.hardware.Name, c.dps.MinTarget, c.dps.ActiveStep)
+		c.log.INFO.Printf("%s: DPS ACTIVE - cooperating with %dW steps",
+			c.hardware.Name, c.dps.ActiveStep)
 	} else if c.dps.Detected {
 		c.log.INFO.Printf("%s: DPS detected but INACTIVE - evcc has full control", c.hardware.Name)
 	}
 }
 
-// logMaxPowerSource logs the source of max power setting
 func (c *BraiinsOS) logMaxPowerSource(effectiveMax int) {
 	maxLabel := "Default"
 	if c.config.MaxPower > 0 {
 		maxLabel = "User-Setting"
 	}
-
 	resetInfo := ""
 	if c.config.DailyResetEnabled {
 		resetInfo = ", daily reset: enabled"
 	}
-
-	c.log.INFO.Printf("%s: evcc configuration: %dW - %dW (%s), %.0fV, interval: %v, step: %dW%s",
+	c.log.INFO.Printf("%s: evcc configuration: %dW - %dW (%s), %.0fV, step: %dW%s",
 		c.hardware.Name, c.hardware.MinWatts, effectiveMax, maxLabel,
-		c.config.Voltage, c.config.PowerTargetInterval, c.config.PowerTargetStep, resetInfo)
+		c.config.Voltage, c.config.PowerTargetStep, resetInfo)
 }
 
-// logIntelligentDecreaseStatus logs intelligent decrease configuration
 func (c *BraiinsOS) logIntelligentDecreaseStatus() {
 	if c.intelligentDecrease.Enabled {
 		c.log.INFO.Printf("%s: Intelligent decrease: ENABLED - wait: %v, step interval: %v",
@@ -549,28 +487,20 @@ func (c *BraiinsOS) logIntelligentDecreaseStatus() {
 	}
 }
 
-// logOnOffConfiguration logs configuration when only on/off control is available
 func (c *BraiinsOS) logOnOffConfiguration() {
 	c.log.INFO.Printf("%s: PowerTarget DISABLED - on/off control only", c.hardware.Name)
-
 	if c.dps.Active {
 		c.log.INFO.Printf("%s: DPS ACTIVE", c.hardware.Name)
 	}
-
 	resetInfo := ""
 	if c.config.DailyResetEnabled {
 		resetInfo = ", daily reset: enabled"
 	}
-
 	c.log.INFO.Printf("%s: evcc configuration: %.0fV%s", c.hardware.Name, c.config.Voltage, resetInfo)
 }
 
-// Authentication methods
-
-// login authenticates with the miner and retrieves a token
 func (c *BraiinsOS) login() error {
 	c.mu.Lock()
-
 	if time.Now().Before(c.auth.TokenExpiry) && c.auth.Token != "" {
 		c.mu.Unlock()
 		return nil
@@ -608,15 +538,12 @@ func (c *BraiinsOS) login() error {
 	return nil
 }
 
-// updateAuthToken updates the authentication token and expiry
 func (c *BraiinsOS) updateAuthToken(resp LoginResponse) {
 	c.auth.Token = resp.Token
-
 	tokenTimeout := time.Duration(resp.TimeoutS) * time.Second
 	if tokenTimeout <= 0 {
 		tokenTimeout = defaultTokenTimeout
 	}
-
 	if tokenTimeout > tokenExpiryBufferSeconds*time.Second {
 		c.auth.TokenExpiry = time.Now().Add(tokenTimeout - tokenExpiryBufferSeconds*time.Second)
 	} else {
@@ -624,80 +551,62 @@ func (c *BraiinsOS) updateAuthToken(resp LoginResponse) {
 	}
 }
 
-// authRequest performs an authenticated HTTP request
 func (c *BraiinsOS) authRequest(method, path string, body any) (*http.Response, error) {
 	for range 2 {
 		resp, err := c.performAuthRequest(method, path, body)
 		if err != nil {
 			return nil, err
 		}
-
 		if resp.StatusCode == http.StatusUnauthorized {
 			c.handleUnauthorized(resp)
 			continue
 		}
-
 		return resp, nil
 	}
-
 	return nil, fmt.Errorf("authentication failed after retry")
 }
 
-// performAuthRequest performs a single authenticated request
 func (c *BraiinsOS) performAuthRequest(method, path string, body any) (*http.Response, error) {
 	if err := c.login(); err != nil {
 		return nil, err
 	}
-
 	req, err := c.createAuthenticatedRequest(method, path, body)
 	if err != nil {
 		return nil, err
 	}
-
 	return c.Do(req)
 }
 
-// createAuthenticatedRequest creates an HTTP request with auth token
 func (c *BraiinsOS) createAuthenticatedRequest(method, path string, body any) (*http.Request, error) {
 	var req *http.Request
 	var err error
-
 	if body != nil {
 		req, err = request.New(method, c.uri+path, request.MarshalJSON(body), request.JSONEncoding)
 	} else {
 		req, err = request.New(method, c.uri+path, nil, request.JSONEncoding)
 	}
-
 	if err != nil {
 		return nil, fmt.Errorf("failed to create authenticated request: %w", err)
 	}
-
 	c.mu.Lock()
 	token := c.auth.Token
 	c.mu.Unlock()
-
 	if token == "" {
 		return nil, fmt.Errorf("no token available after login")
 	}
-
 	req.Header.Set("Authorization", token)
 	return req, nil
 }
 
-// handleUnauthorized handles 401 responses by clearing auth state
 func (c *BraiinsOS) handleUnauthorized(resp *http.Response) {
 	c.log.WARN.Printf("%s: Token invalid (401), attempting re-authentication", c.hardware.Name)
 	c.closeResponseBody(resp)
-
 	c.mu.Lock()
 	c.auth.Token = ""
 	c.auth.TokenExpiry = time.Time{}
 	c.mu.Unlock()
 }
 
-// HTTP response handling
-
-// handleHTTPResponse checks HTTP response status and returns error if needed
 func (c *BraiinsOS) handleHTTPResponse(resp *http.Response, operation string) error {
 	if resp.StatusCode == http.StatusUnauthorized {
 		return fmt.Errorf("authentication failed after retry: %s (HTTP %d)", resp.Status, resp.StatusCode)
@@ -711,46 +620,36 @@ func (c *BraiinsOS) handleHTTPResponse(resp *http.Response, operation string) er
 	return nil
 }
 
-// closeResponseBody safely closes response body
 func (c *BraiinsOS) closeResponseBody(resp *http.Response) {
 	if resp != nil && resp.Body != nil {
 		resp.Body.Close()
 	}
 }
 
-// Hardware discovery methods
-
-// discoverConstraints retrieves hardware power constraints
 func (c *BraiinsOS) discoverConstraints() error {
 	resp, err := c.authRequest(http.MethodGet, apiPathConstraints, nil)
 	if err != nil {
 		return fmt.Errorf("constraints request failed: %w", err)
 	}
 	defer c.closeResponseBody(resp)
-
 	if err := c.handleHTTPResponse(resp, "constraints request"); err != nil {
 		return err
 	}
-
 	var constraints ConfigConstraints
 	if err := json.NewDecoder(resp.Body).Decode(&constraints); err != nil {
 		return fmt.Errorf("failed to decode constraints: %w", err)
 	}
-
 	c.updateHardwareCapabilities(constraints)
 	return nil
 }
 
-// updateHardwareCapabilities updates hardware limits from constraints
 func (c *BraiinsOS) updateHardwareCapabilities(constraints ConfigConstraints) {
 	c.hardware.MinWatts = constraints.TunerConstraints.PowerTarget.Min.Watt
 	c.hardware.DefaultWatts = constraints.TunerConstraints.PowerTarget.Default.Watt
 	c.hardware.MaxWatts = constraints.TunerConstraints.PowerTarget.Max.Watt
-
 	dpsStep := constraints.DPSConstraints.PowerStep.Default.Watt
 	dpsMinTarget := constraints.DPSConstraints.MinPowerTarget.Default.Watt
 	c.dps.Detected = dpsStep > 0 && dpsMinTarget > 0
-
 	if c.dps.Detected {
 		c.dps.MinTarget = dpsMinTarget
 		c.log.DEBUG.Printf("%s: DPS hardware detected: %dW, %dW",
@@ -758,74 +657,74 @@ func (c *BraiinsOS) updateHardwareCapabilities(constraints ConfigConstraints) {
 	}
 }
 
-// discoverMinerStatus retrieves current miner configuration
 func (c *BraiinsOS) discoverMinerStatus() error {
 	resp, err := c.authRequest(http.MethodGet, apiPathMinerConfig, nil)
 	if err != nil {
 		return fmt.Errorf("miner config request failed: %w", err)
 	}
 	defer c.closeResponseBody(resp)
-
 	if err := c.handleHTTPResponse(resp, "miner config request"); err != nil {
 		return err
 	}
-
 	var config MinerConfiguration
 	if err := json.NewDecoder(resp.Body).Decode(&config); err != nil {
 		return fmt.Errorf("failed to decode miner config: %w", err)
 	}
-
 	c.updatePowerTargetState(config)
 	c.updateDPSState(config)
-
 	return nil
 }
 
-// updatePowerTargetState updates power target state from config
 func (c *BraiinsOS) updatePowerTargetState(config MinerConfiguration) {
 	c.powerState.Enabled = config.Tuner.Enabled && c.hardware.MaxWatts > 0
-
 	if c.powerState.Enabled {
 		currentTarget := c.hardware.DefaultWatts
 		if config.Tuner.PowerTarget != nil {
 			currentTarget = config.Tuner.PowerTarget.Watt
 			c.powerState.LastTarget = currentTarget
+			c.powerState.IsFromDiscovery = true
 		}
 		c.log.DEBUG.Printf("%s: PowerTarget detected: %dW", c.hardware.Name, currentTarget)
 	}
 }
 
-// updateDPSState updates DPS state from config
 func (c *BraiinsOS) updateDPSState(config MinerConfiguration) {
 	c.dps.Active = config.DPS.Enabled
 	c.dps.ActiveStep = config.DPS.PowerStep.Watt
-
+	if c.dps.Active && c.dps.ActiveStep <= 0 {
+		c.dps.ActiveStep = c.config.PowerTargetStep
+		c.log.DEBUG.Printf("%s: DPS step not configured, using default: %dW",
+			c.hardware.Name, c.config.PowerTargetStep)
+	}
 	if c.dps.Detected && c.dps.Active {
 		c.log.DEBUG.Printf("%s: DPS configuration: min=%dW, step=%dW",
 			c.hardware.Name, c.dps.MinTarget, c.dps.ActiveStep)
 	}
 }
 
-// Power calculation methods
-
-// getEffectiveMaxPower returns the maximum power considering configuration
 func (c *BraiinsOS) getEffectiveMaxPower() int {
 	effectiveMax := c.hardware.DefaultWatts
 	if c.config.MaxPower > 0 {
 		effectiveMax = c.config.MaxPower
 	}
-
 	if effectiveMax > c.hardware.MaxWatts {
 		effectiveMax = c.hardware.MaxWatts
 	}
-	if effectiveMax < c.hardware.MinWatts {
-		effectiveMax = c.hardware.MinWatts
+	effectiveMin := c.getEffectiveMinWatts()
+	if effectiveMax < effectiveMin {
+		effectiveMax = effectiveMin
 	}
-
 	return effectiveMax
 }
 
-// getMinCurrent calculates minimum current based on voltage and power
+func (c *BraiinsOS) getEffectiveMinWatts() int {
+	minWatts := c.hardware.MinWatts
+	if c.dps.Active && c.dps.MinTarget > 0 {
+		minWatts = c.dps.MinTarget
+	}
+	return minWatts
+}
+
 func (c *BraiinsOS) getMinCurrent() float64 {
 	voltage := c.config.Voltage
 	if voltage <= 0 {
@@ -833,153 +732,93 @@ func (c *BraiinsOS) getMinCurrent() float64 {
 			c.hardware.Name, c.config.Voltage)
 		voltage = defaultVoltage
 	}
-
-	minWatts := c.hardware.MinWatts
-	if c.dps.Active && c.dps.MinTarget > 0 {
-		minWatts = c.dps.MinTarget
-	}
-
+	minWatts := c.getEffectiveMinWatts()
 	return float64(minWatts) / voltage
 }
 
-// calculateDPSTarget calculates target power aligned to DPS steps
-func (c *BraiinsOS) calculateDPSTarget(powerRequest float64) int {
-	dpsMinimum := c.dps.MinTarget
-	if dpsMinimum <= 0 {
-		dpsMinimum = c.hardware.MinWatts
-	}
-
-	dpsStep := c.dps.ActiveStep
-	if dpsStep <= 0 {
-		dpsStep = defaultDPSStep
-	}
-
-	requestInt := int(math.Round(powerRequest))
-	if requestInt <= dpsMinimum {
-		return dpsMinimum
-	}
-
-	// Better rounding: add half step before division to avoid .5 issues
-	stepsNeeded := max(0, int((float64(requestInt-dpsMinimum)+float64(dpsStep)/2)/float64(dpsStep)))
-
-	targetPower := dpsMinimum + stepsNeeded*dpsStep
+func (c *BraiinsOS) calculateTargetPower(powerRequest float64, isIncreasing bool) int {
+	minLimit := c.getEffectiveMinWatts()
 	effectiveMax := c.getEffectiveMaxPower()
-	if targetPower > effectiveMax {
-		targetPower = effectiveMax
+	stepSize := c.config.PowerTargetStep
+	if c.dps.Active && c.dps.ActiveStep > 0 {
+		stepSize = c.dps.ActiveStep
 	}
-
+	if stepSize <= 0 || stepSize >= effectiveMax {
+		c.log.WARN.Printf("%s: Invalid stepSize %d (min=%d, max=%d), using default %d",
+			c.hardware.Name, stepSize, minLimit, effectiveMax, defaultPowerTargetStep)
+		stepSize = defaultPowerTargetStep
+	}
+	limitedPower := math.Max(float64(minLimit), powerRequest)
+	limitedPower = math.Min(float64(effectiveMax), limitedPower)
+	var targetPower int
+	if c.dps.Active {
+		requestInt := int(math.Round(limitedPower))
+		if requestInt <= minLimit {
+			return minLimit
+		}
+		stepsFromMin := (requestInt - minLimit + stepSize/2) / stepSize
+		targetPower = minLimit + stepsFromMin*stepSize
+	} else {
+		var steps int
+		if isIncreasing {
+			steps = int(math.Ceil(limitedPower / float64(stepSize)))
+		} else {
+			steps = int(math.Round(limitedPower / float64(stepSize)))
+		}
+		targetPower = steps * stepSize
+	}
+	targetPower = max(minLimit, min(targetPower, effectiveMax))
 	return targetPower
 }
 
-// calculateTargetPower calculates target power with stepping
-func (c *BraiinsOS) calculateTargetPower(powerRequest float64, isIncreasing bool) int {
-	if c.dps.Active {
-		return c.calculateDPSTarget(powerRequest)
-	}
-
-	effectiveMax := c.getEffectiveMaxPower()
-	stepSize := c.config.PowerTargetStep
-	minLimit := c.hardware.MinWatts
-
-	if stepSize >= effectiveMax {
-		stepSize = 1
-	}
-
-	limitedPower := math.Max(float64(minLimit), powerRequest)
-	limitedPower = math.Min(float64(effectiveMax), limitedPower)
-
-	var steps int
-	if isIncreasing {
-		steps = int(math.Ceil(limitedPower / float64(stepSize)))
-	} else {
-		steps = int(math.Round(limitedPower / float64(stepSize)))
-	}
-
-	targetPowerInt := steps * stepSize
-
-	// Clamp between min and max using built-in functions
-	targetPowerInt = max(minLimit, min(targetPowerInt, effectiveMax))
-
-	return targetPowerInt
-}
-
-// Miner status and control
-
-// getMinerStatus retrieves current miner status
 func (c *BraiinsOS) getMinerStatus() (int, error) {
 	resp, err := c.authRequest(http.MethodGet, apiPathMinerDetails, nil)
 	if err != nil {
 		return 0, fmt.Errorf("miner details request failed: %w", err)
 	}
 	defer c.closeResponseBody(resp)
-
 	if err := c.handleHTTPResponse(resp, "miner details"); err != nil {
 		return 0, err
 	}
-
 	var details MinerDetails
 	if err := json.NewDecoder(resp.Body).Decode(&details); err != nil {
 		return 0, fmt.Errorf("failed to decode miner details: %w", err)
 	}
-
 	return details.Status, nil
 }
 
-// setPowerTarget sets the miner's power target
 func (c *BraiinsOS) setPowerTarget(targetWatts int) error {
 	c.log.INFO.Printf("%s: Setting power target to %dW", c.hardware.Name, targetWatts)
-
 	resp, err := c.authRequest(http.MethodPut, apiPathPowerTarget, PowerTarget{Watt: targetWatts})
 	if err != nil {
 		return fmt.Errorf("set power target failed: %w", err)
 	}
 	defer c.closeResponseBody(resp)
-
 	if err := c.handlePowerTargetResponse(resp); err != nil {
 		return err
 	}
-
 	c.mu.Lock()
 	c.powerState.LastTarget = targetWatts
 	c.powerState.LastUpdate = time.Now()
+	c.powerState.IsFromDiscovery = false
 	c.mu.Unlock()
-
 	c.log.INFO.Printf("%s: Power target set successfully: %dW", c.hardware.Name, targetWatts)
 	return nil
 }
 
-// handlePowerTargetResponse handles power target response errors
 func (c *BraiinsOS) handlePowerTargetResponse(resp *http.Response) error {
 	switch resp.StatusCode {
 	case http.StatusForbidden:
-		c.logPowerTargetError(resp, "BLOCKED", 403)
-		return fmt.Errorf("power target blocked by DPS (HTTP 403)")
+		c.log.DEBUG.Printf("%s: Power target temporarily deferred - DPS is actively regulating", c.hardware.Name)
+		return nil
 	case http.StatusConflict:
-		c.log.ERROR.Printf("%s: Power target CONFLICT (409) - DPS interference", c.hardware.Name)
-		return fmt.Errorf("power target conflict with DPS (HTTP 409)")
+		c.log.DEBUG.Printf("%s: Power target deferred - DPS transition in progress", c.hardware.Name)
+		return nil
 	}
-
 	return c.handleHTTPResponse(resp, "set power target")
 }
 
-// logPowerTargetError logs detailed power target error
-func (c *BraiinsOS) logPowerTargetError(resp *http.Response, errorType string, statusCode int) {
-	if resp.Body != nil {
-		body, _ := io.ReadAll(io.LimitReader(resp.Body, maxResponseBodyBytes))
-		if len(body) > 0 {
-			c.log.DEBUG.Printf("%s: Error response body: %s", c.hardware.Name, string(body))
-		}
-	}
-	c.log.ERROR.Printf("%s: Power target %s (%d) - DPS conflict detected",
-		c.hardware.Name, errorType, statusCode)
-	if c.dps.Active {
-		c.log.ERROR.Printf("%s: DPS is active - disable DPS for full evcc control", c.hardware.Name)
-	}
-}
-
-// Intelligent power decrease methods
-
-// shouldActuallyDecrease determines if power should be decreased
+// shouldActuallyDecrease determines if we should decrease and returns the power to decrease TO
 func (c *BraiinsOS) shouldActuallyDecrease(requestedPower float64) (bool, float64) {
 	if !c.intelligentDecrease.Enabled {
 		return true, requestedPower
@@ -991,46 +830,62 @@ func (c *BraiinsOS) shouldActuallyDecrease(requestedPower float64) (bool, float6
 	c.trackPowerRequest(requestedPower)
 
 	currentTarget := c.powerState.LastTarget
-	isLow := requestedPower < float64(currentTarget)*lowPowerThreshold
+	threshold := float64(currentTarget) * lowPowerThreshold
 
-	if isLow {
-		return c.evaluateLowPowerCondition(requestedPower, currentTarget)
+	effectiveMin := c.getEffectiveMinWatts()
+	if currentTarget <= effectiveMin {
+		if c.lp != nil {
+			mode := c.lp.GetMode()
+
+			if mode == api.ModeMinPV {
+				return false, float64(currentTarget)
+			}
+		}
+
+		threshold = float64(effectiveMin)
 	}
 
-	return c.handlePowerRecovery(), float64(currentTarget)
+	isLow := requestedPower < threshold
+
+	if isLow {
+		shouldDecrease, power := c.evaluateLowPowerCondition(currentTarget)
+		return shouldDecrease, power
+	}
+
+	result := c.handlePowerRecovery()
+	return result, float64(currentTarget)
 }
 
-// trackPowerRequest adds current request to history using ring buffer
 func (c *BraiinsOS) trackPowerRequest(requestedPower float64) {
 	now := time.Now()
-
-	// Write to current index
 	c.intelligentDecrease.RecentRequests[c.intelligentDecrease.RequestIndex] = requestedPower
 	c.intelligentDecrease.RecentRequestTimes[c.intelligentDecrease.RequestIndex] = now
-
-	// Move index forward (wrap around at limit)
 	c.intelligentDecrease.RequestIndex = (c.intelligentDecrease.RequestIndex + 1) % defaultRecentRequestsLimit
-
-	// Increment count until we reach limit
 	if c.intelligentDecrease.RequestCount < defaultRecentRequestsLimit {
 		c.intelligentDecrease.RequestCount++
 	}
 }
 
-// evaluateLowPowerCondition evaluates if decrease should proceed
-func (c *BraiinsOS) evaluateLowPowerCondition(requestedPower float64, currentTarget int) (bool, float64) {
+func (c *BraiinsOS) evaluateLowPowerCondition(currentTarget int) (bool, float64) {
 	now := time.Now()
+	if !c.intelligentDecrease.LowPowerStart.IsZero() {
+		lowDuration := now.Sub(c.intelligentDecrease.LowPowerStart)
+		if lowDuration > time.Hour {
+			c.log.INFO.Printf("%s: Timer stale (%v old), restarting wait timer",
+				c.hardware.Name, lowDuration.Round(time.Minute))
+			c.intelligentDecrease.LowPowerStart = now
+		}
+	}
 
-	// Start timer on first low request
 	if c.intelligentDecrease.LowPowerStart.IsZero() {
 		c.intelligentDecrease.LowPowerStart = now
-		c.log.INFO.Printf("%s: Insufficient solar detected - starting 15min wait timer (miner continues at current power)",
-			c.hardware.Name)
+		c.intelligentDecrease.LastTimer1LoggedMinute = 0
+		c.log.INFO.Printf("%s: Insufficient solar detected - starting %v wait timer (miner continues at current power)",
+			c.hardware.Name, c.intelligentDecrease.MinDecreaseDuration)
 	}
 
 	lowDuration := now.Sub(c.intelligentDecrease.LowPowerStart)
 
-	// Timer 1: Check if minimum duration has passed
 	if lowDuration < c.intelligentDecrease.MinDecreaseDuration {
 		remaining := c.intelligentDecrease.MinDecreaseDuration - lowDuration
 		c.log.INFO.Printf("%s: Wait timer: %v elapsed, %v remaining (miner maintaining current power)",
@@ -1038,18 +893,14 @@ func (c *BraiinsOS) evaluateLowPowerCondition(requestedPower float64, currentTar
 		return false, float64(currentTarget)
 	}
 
-	// Check consistency
 	if !c.hasConsistentLowPower(currentTarget) {
 		return false, float64(currentTarget)
 	}
 
-	// Timer 1 complete - return average for calculation
-	// Actual decrease step will be logged when it happens (after Timer 2 check)
 	avgPower := c.calculateAveragePower()
 	return true, avgPower
 }
 
-// hasConsistentLowPower checks if recent requests are consistently low
 func (c *BraiinsOS) hasConsistentLowPower(currentTarget int) bool {
 	requiredSamples := c.intelligentDecrease.ConsistencyChecks
 	if c.intelligentDecrease.RequestCount < requiredSamples {
@@ -1060,15 +911,22 @@ func (c *BraiinsOS) hasConsistentLowPower(currentTarget int) bool {
 
 	lowCount := 0
 	threshold := float64(currentTarget) * lowPowerThreshold
+	c.log.DEBUG.Printf("%s: Consistency check: need %d/%d samples below %.0fW (%.0f%% of %dW)",
+		c.hardware.Name, int(float64(requiredSamples)*requiredConsistencyRatio), requiredSamples,
+		threshold, lowPowerThreshold*100, currentTarget)
 
-	// Read last N samples from ring buffer
+	var samples []float64
 	for i := range requiredSamples {
-		// Calculate actual index: go backwards from current position
 		idx := (c.intelligentDecrease.RequestIndex - 1 - i + defaultRecentRequestsLimit) % defaultRecentRequestsLimit
-		if c.intelligentDecrease.RecentRequests[idx] < threshold {
+		sample := c.intelligentDecrease.RecentRequests[idx]
+		samples = append(samples, sample)
+		if sample < threshold {
 			lowCount++
 		}
 	}
+
+	c.log.DEBUG.Printf("%s: Recent samples: %v (lowCount=%d/%d)",
+		c.hardware.Name, samples, lowCount, requiredSamples)
 
 	requiredLow := int(float64(requiredSamples) * requiredConsistencyRatio)
 	if lowCount < requiredLow {
@@ -1080,171 +938,127 @@ func (c *BraiinsOS) hasConsistentLowPower(currentTarget int) bool {
 	return true
 }
 
-// calculateAveragePower calculates average of recent requests
 func (c *BraiinsOS) calculateAveragePower() float64 {
 	requiredSamples := c.intelligentDecrease.ConsistencyChecks
-
 	sum := 0.0
-	// Read last N samples from ring buffer
 	for i := range requiredSamples {
-		// Calculate actual index: go backwards from current position
 		idx := (c.intelligentDecrease.RequestIndex - 1 - i + defaultRecentRequestsLimit) % defaultRecentRequestsLimit
 		sum += c.intelligentDecrease.RecentRequests[idx]
 	}
-
 	return sum / float64(requiredSamples)
 }
 
-// handlePowerRecovery handles power recovery scenario
 func (c *BraiinsOS) handlePowerRecovery() bool {
 	if !c.intelligentDecrease.LowPowerStart.IsZero() {
-		duration := time.Since(c.intelligentDecrease.LowPowerStart)
-		c.log.INFO.Printf("%s: Solar power recovered after %v - canceling decrease timer, maintaining power",
-			c.hardware.Name, duration.Round(time.Second))
+		c.log.INFO.Printf("%s: Solar power recovered - resetting timers", c.hardware.Name)
 		c.intelligentDecrease.LowPowerStart = time.Time{}
+		c.intelligentDecrease.LastDecreaseStep = time.Time{}
 	}
+
 	return false
 }
 
-// handlePowerDecrease handles gradual power decrease
-func (c *BraiinsOS) handlePowerDecrease(originalRequest, clippedRequest float64, currentTarget int, wasClipped bool) (float64, error) {
-	// Timer 1: Use ORIGINAL request (not clipped) for timer decision
-	shouldDecrease, avgPower := c.shouldActuallyDecrease(originalRequest)
+func (c *BraiinsOS) handlePowerDecrease(originalRequest float64, currentTarget int, wasClipped bool) (int, error) {
+	shouldDecrease, decreasePower := c.shouldActuallyDecrease(originalRequest)
+
 	if !shouldDecrease {
-		// Timer not expired yet - keep current (clipped) request
-		return clippedRequest, nil
+		return currentTarget, nil
 	}
 
-	// Timer 1 has expired!
-	// If we're already at minimum (wasClipped), turn off miner
-	if wasClipped {
-		c.log.INFO.Printf("%s: Wait timer expired while at minimum power - insufficient solar, turning off",
-			c.hardware.Name)
-		c.resetDecreaseTracking()
-		return 0, nil // Signal to turn off
+	newTarget := c.calculateDecreasedTarget(decreasePower, currentTarget, wasClipped)
+
+	if newTarget == currentTarget {
+		return currentTarget, nil
 	}
 
-	// Timer 2: Check step interval
+	c.logDecreaseStep(newTarget, currentTarget)
+	return newTarget, nil
+}
+
+func (c *BraiinsOS) calculateDecreasedTarget(decreasePower float64, currentTarget int, wasClipped bool) int {
+	var newTarget int
 	c.mu.Lock()
-	lastDecreaseStep := c.intelligentDecrease.LastDecreaseStep
-	lowPowerStart := c.intelligentDecrease.LowPowerStart
-	c.mu.Unlock()
 
 	now := time.Now()
+	timeSinceLastStep := time.Since(c.intelligentDecrease.LastDecreaseStep)
 
-	// Log once when Timer 1 first expires
-	if lastDecreaseStep.IsZero() && !lowPowerStart.IsZero() {
-		duration := now.Sub(lowPowerStart)
-		c.log.INFO.Printf("%s: Wait timer complete after %v - ready to decrease (avg solar: %.0fW)",
-			c.hardware.Name, duration.Round(time.Second), avgPower)
-	}
-
-	if !lastDecreaseStep.IsZero() {
-		timeSinceLastStep := now.Sub(lastDecreaseStep)
-		if timeSinceLastStep < c.intelligentDecrease.DecreaseStepInterval {
-			waitTime := c.intelligentDecrease.DecreaseStepInterval - timeSinceLastStep
-			c.log.DEBUG.Printf("%s: Step interval: %v elapsed, waiting %v more before next step",
-				c.hardware.Name, timeSinceLastStep.Round(time.Second),
-				waitTime.Round(time.Second))
-			return clippedRequest, nil // No change
+	if !c.intelligentDecrease.LastDecreaseStep.IsZero() &&
+		timeSinceLastStep < c.intelligentDecrease.DecreaseStepInterval {
+		elapsedMinutes := int(timeSinceLastStep.Minutes())
+		if elapsedMinutes > c.intelligentDecrease.LastTimer2LoggedMinute {
+			c.intelligentDecrease.LastTimer2LoggedMinute = elapsedMinutes
+			remaining := c.intelligentDecrease.DecreaseStepInterval - timeSinceLastStep
+			c.log.INFO.Printf("%s: Step timer: %v elapsed, %v remaining before next decrease step",
+				c.hardware.Name, timeSinceLastStep.Round(time.Minute), remaining.Round(time.Minute))
 		}
+
+		c.mu.Unlock()
+		return currentTarget
 	}
 
-	return c.calculateGradualDecrease(avgPower, currentTarget, now)
-}
-
-// calculateGradualDecrease calculates next step in gradual decrease
-func (c *BraiinsOS) calculateGradualDecrease(avgPower float64, currentTarget int, now time.Time) (float64, error) {
-	stepSize := c.getDecreaseStepSize()
-	oneStepDown := currentTarget - stepSize
-
-	// If next step would be at or below minimum, turn off instead of staying at minimum
-	if oneStepDown <= c.hardware.MinWatts {
-		c.log.INFO.Printf("%s: Next step (%dW) would be at/below minimum (%dW) - turning off",
-			c.hardware.Name, oneStepDown, c.hardware.MinWatts)
-		c.resetDecreaseTracking()
-		return 0, nil // Signal to turn off
-	}
-
-	targetFromAvg := int(math.Round(avgPower/float64(stepSize))) * stepSize
-
-	// If average power is below minimum, turn off instead of clipping
-	if targetFromAvg < c.hardware.MinWatts {
-		c.log.INFO.Printf("%s: Average power (%dW) below minimum (%dW) - turning off",
-			c.hardware.Name, targetFromAvg, c.hardware.MinWatts)
-		c.resetDecreaseTracking()
-		return 0, nil // Signal to turn off
-	}
-
-	if oneStepDown <= targetFromAvg {
-		return c.performFinalDecreaseStep(targetFromAvg, currentTarget)
-	}
-
-	return c.performIntermediateDecreaseStep(oneStepDown, targetFromAvg, currentTarget, stepSize, now)
-}
-
-// getDecreaseStepSize returns the step size for decreasing
-func (c *BraiinsOS) getDecreaseStepSize() int {
 	stepSize := c.config.PowerTargetStep
 	if c.dps.Active && c.dps.ActiveStep > 0 {
 		stepSize = c.dps.ActiveStep
 	}
-	if stepSize == 0 {
-		stepSize = defaultDPSStep
+
+	// CRITICAL FIX v0.4.35: Calculate DPS-aligned decreased target
+	candidatePower := decreasePower - float64(stepSize)
+	c.mu.Unlock() // Unlock before calling calculateTargetPower (it doesn't use mutex)
+
+	candidate := c.calculateTargetPower(candidatePower, false)
+
+	c.mu.Lock() // Re-lock for the rest of the function
+
+	if candidate <= 0 {
+		newTarget = 0
+	} else {
+		minTarget := c.getEffectiveMinWatts()
+
+		if candidate < minTarget {
+			if wasClipped {
+				newTarget = 0
+			} else if currentTarget <= minTarget+stepSize {
+				c.log.INFO.Printf("%s: Near minimum power (%dW), shutting down to avoid hanging at minimum",
+					c.hardware.Name, currentTarget)
+				newTarget = 0
+			} else {
+				newTarget = minTarget
+			}
+		} else {
+			newTarget = candidate
+		}
 	}
-	return stepSize
-}
 
-// performFinalDecreaseStep performs the final step to target
-func (c *BraiinsOS) performFinalDecreaseStep(targetFromAvg, currentTarget int) (float64, error) {
-	// Safety check: if target is below minimum, turn off
-	if targetFromAvg < c.hardware.MinWatts {
-		c.log.INFO.Printf("%s: Final target (%dW) below minimum (%dW) - turning off",
-			c.hardware.Name, targetFromAvg, c.hardware.MinWatts)
-		c.resetDecreaseTracking()
-		return 0, nil
-	}
-
-	c.log.INFO.Printf("%s: Final decrease step to target: %dW -> %dW",
-		c.hardware.Name, currentTarget, targetFromAvg)
-
-	c.mu.Lock()
-	c.intelligentDecrease.LastDecreaseStep = time.Time{}
-	c.intelligentDecrease.LowPowerStart = time.Time{}
-	c.mu.Unlock()
-
-	return float64(targetFromAvg), nil
-}
-
-// performIntermediateDecreaseStep performs an intermediate decrease step
-func (c *BraiinsOS) performIntermediateDecreaseStep(oneStepDown, targetFromAvg, currentTarget, stepSize int, now time.Time) (float64, error) {
-	stepsRemaining := (oneStepDown - targetFromAvg) / stepSize
-	c.log.INFO.Printf("%s: Power decrease step: %dW -> %dW (-%dW, %d more steps to avg target %dW)",
-		c.hardware.Name, currentTarget, oneStepDown, stepSize, stepsRemaining, targetFromAvg)
-
-	c.mu.Lock()
 	c.intelligentDecrease.LastDecreaseStep = now
+	c.intelligentDecrease.LastTimer2LoggedMinute = 0
+
 	c.mu.Unlock()
 
-	return float64(oneStepDown), nil
+	return newTarget
 }
 
-// resetDecreaseTracking resets intelligent decrease timers
+func (c *BraiinsOS) logDecreaseStep(newTarget, currentTarget int) {
+	decreaseAmount := currentTarget - newTarget
+	c.log.INFO.Printf("%s: Decreasing power: %dW → %dW (-%dW step)",
+		c.hardware.Name, currentTarget, newTarget, decreaseAmount)
+}
+
 func (c *BraiinsOS) resetDecreaseTracking() {
 	c.mu.Lock()
-	c.intelligentDecrease.LastDecreaseStep = time.Time{}
-	c.intelligentDecrease.LowPowerStart = time.Time{}
-	c.mu.Unlock()
+	defer c.mu.Unlock()
+
+	if !c.intelligentDecrease.LowPowerStart.IsZero() {
+		c.intelligentDecrease.LowPowerStart = time.Time{}
+		c.intelligentDecrease.LastDecreaseStep = time.Time{}
+		c.intelligentDecrease.LoggedFirstExpiry = false
+		c.log.DEBUG.Printf("%s: Intelligent decrease timers reset", c.hardware.Name)
+	}
 }
 
-// Daily reset methods
-
-// checkDailyReset checks and performs daily reset if needed
 func (c *BraiinsOS) checkDailyReset() api.ChargeStatus {
 	if !c.config.DailyResetEnabled {
 		return api.StatusNone
 	}
-
 	now := time.Now()
 	if now.Hour() == dailyResetHour && now.Minute() == dailyResetMinute {
 		c.mu.Lock()
@@ -1260,14 +1074,22 @@ func (c *BraiinsOS) checkDailyReset() api.ChargeStatus {
 		c.session.DailyResetDone = false
 		c.mu.Unlock()
 	}
-
 	return api.StatusNone
 }
 
-// API interface implementations
-
-// CurrentPower returns the current power consumption
 func (c *BraiinsOS) CurrentPower() (float64, error) {
+	c.mu.Lock()
+	isPausing := c.powerState.IsPausing
+	pauseStarted := c.powerState.PauseStarted
+	c.mu.Unlock()
+
+	if isPausing && !pauseStarted.IsZero() && time.Since(pauseStarted) < 60*time.Second {
+		elapsed := time.Since(pauseStarted).Round(time.Second)
+		c.log.DEBUG.Printf("%s: Miner in pause grace period (%v elapsed), returning 0W to avoid stale reading",
+			c.hardware.Name, elapsed)
+		return 0, nil
+	}
+
 	resp, err := c.authRequest(http.MethodGet, apiPathMinerStats, nil)
 	if err != nil {
 		return 0, fmt.Errorf("stats request failed: %w", err)
@@ -1287,32 +1109,206 @@ func (c *BraiinsOS) CurrentPower() (float64, error) {
 	return power, nil
 }
 
-// Currents returns the calculated current (single phase)
 func (c *BraiinsOS) Currents() (float64, float64, float64, error) {
 	power, err := c.CurrentPower()
 	if err != nil {
 		return 0, 0, 0, err
 	}
-
 	if c.config.Voltage <= 0 {
 		return 0, 0, 0, fmt.Errorf("invalid voltage: %.2f", c.config.Voltage)
 	}
-
 	current := power / c.config.Voltage
-	c.log.DEBUG.Printf("%s: Calculated current: %.2fA from %.0fW at %.0fV",
-		c.hardware.Name, current, power, c.config.Voltage)
 	return current, 0, 0, nil
 }
 
-// Status returns the current charge status
+func (c *BraiinsOS) handleModeSpecificBehavior() {
+	mode := c.lp.GetMode()
+	c.mu.Lock()
+	c.currentMode = mode
+	c.mu.Unlock()
+
+	switch mode {
+	case api.ModeMinPV:
+		c.mu.Lock()
+		if !c.intelligentDecrease.LowPowerStart.IsZero() {
+			c.log.DEBUG.Printf("%s: MinPV mode (target: %dW) - resetting any running decrease timer",
+				c.hardware.Name, c.powerState.LastTarget)
+			c.intelligentDecrease.LowPowerStart = time.Time{}
+		}
+		c.mu.Unlock()
+
+	case api.ModePV:
+		effectiveMin := c.getEffectiveMinWatts()
+		atMinimum := c.powerState.LastTarget <= effectiveMin && c.powerState.LastTarget > 0
+
+		if atMinimum {
+			enabled, err := c.Enabled()
+			if err != nil || !enabled {
+				c.mu.Lock()
+				if !c.intelligentDecrease.LowPowerStart.IsZero() {
+					c.intelligentDecrease.LowPowerStart = time.Time{}
+					c.log.DEBUG.Printf("%s: PV mode - miner OFF, clearing decrease timer", c.hardware.Name)
+				}
+				c.mu.Unlock()
+				return
+			}
+
+			c.mu.Lock()
+			if c.intelligentDecrease.LowPowerStart.IsZero() {
+				c.log.INFO.Printf("%s: PV mode (target: %dW) - running at minimum with insufficient PV - starting 15min decrease timer",
+					c.hardware.Name, c.powerState.LastTarget)
+				c.intelligentDecrease.LowPowerStart = time.Now()
+				c.intelligentDecrease.LastTimer1LoggedMinute = 0
+			}
+			c.mu.Unlock()
+		}
+
+		c.mu.Lock()
+		if !c.intelligentDecrease.LowPowerStart.IsZero() {
+			elapsed := time.Since(c.intelligentDecrease.LowPowerStart)
+			c.mu.Unlock()
+
+			if elapsed >= c.intelligentDecrease.MinDecreaseDuration {
+				if !c.intelligentDecrease.LoggedFirstExpiry {
+					c.log.INFO.Printf("%s: Decrease timer elapsed (%v) - starting stepped shutdown",
+						c.hardware.Name, elapsed.Round(time.Second))
+					c.intelligentDecrease.LoggedFirstExpiry = true
+				}
+				c.performSteppedShutdown()
+			} else {
+				elapsedMinutes := int(elapsed.Minutes())
+				if elapsedMinutes > c.intelligentDecrease.LastTimer1LoggedMinute {
+					c.intelligentDecrease.LastTimer1LoggedMinute = elapsedMinutes
+					remaining := c.intelligentDecrease.MinDecreaseDuration - elapsed
+					c.log.DEBUG.Printf("%s: PV mode (target: %dW) - decrease timer: %v elapsed, %v remaining",
+						c.hardware.Name, c.powerState.LastTarget,
+						elapsed.Round(time.Minute), remaining.Round(time.Minute))
+				}
+			}
+		} else {
+			c.mu.Unlock()
+		}
+
+	case api.ModeNow:
+		c.mu.Lock()
+		if !c.intelligentDecrease.LowPowerStart.IsZero() {
+			c.log.DEBUG.Printf("%s: Now mode (target: %dW) - full charge requested, resetting decrease timer",
+				c.hardware.Name, c.powerState.LastTarget)
+			c.intelligentDecrease.LowPowerStart = time.Time{}
+		}
+		c.mu.Unlock()
+
+	case api.ModeOff:
+		c.mu.Lock()
+		if !c.intelligentDecrease.LowPowerStart.IsZero() {
+			c.log.DEBUG.Printf("%s: Off mode - resetting decrease timer",
+				c.hardware.Name)
+			c.intelligentDecrease.LowPowerStart = time.Time{}
+		}
+		c.mu.Unlock()
+	}
+}
+
+func (c *BraiinsOS) performSteppedShutdown() {
+	var action int
+	var target int
+
+	c.mu.Lock()
+
+	now := time.Now()
+
+	if !c.intelligentDecrease.LastDecreaseStep.IsZero() {
+		timeSinceLastStep := time.Since(c.intelligentDecrease.LastDecreaseStep)
+		if timeSinceLastStep < c.intelligentDecrease.DecreaseStepInterval {
+			c.mu.Unlock()
+			return
+		}
+	}
+
+	currentTarget := c.powerState.LastTarget
+
+	effectiveMin := c.getEffectiveMinWatts()
+	stepSize := c.config.PowerTargetStep
+	if c.dps.Active && c.dps.ActiveStep > 0 {
+		stepSize = c.dps.ActiveStep
+	}
+
+	nextTarget := currentTarget - stepSize
+
+	if nextTarget <= effectiveMin {
+		action = 2
+
+		c.powerState.IsPausing = true
+		c.powerState.PauseStarted = time.Now()
+
+		c.powerState.PausedByTimer = true
+		c.log.INFO.Printf("%s: Step-wise decrease reached minimum (%dW → disable) - shutting down miner",
+			c.hardware.Name, currentTarget)
+		c.log.INFO.Printf("%s: Miner paused by intelligent decrease timer - remains off until sufficient solar power returns",
+			c.hardware.Name)
+	} else {
+		action = 1
+		target = nextTarget
+
+		c.powerState.LastTarget = nextTarget
+		c.intelligentDecrease.LastDecreaseStep = now
+
+		c.log.INFO.Printf("%s: Step-wise decrease: %dW → %dW (next step in %v)",
+			c.hardware.Name, currentTarget, nextTarget, c.intelligentDecrease.DecreaseStepInterval)
+	}
+
+	c.mu.Unlock()
+
+	switch action {
+	case 1:
+		err := c.setPowerTarget(target)
+		if err != nil {
+			c.log.ERROR.Printf("%s: Failed to set power target during stepped shutdown: %v", c.hardware.Name, err)
+		}
+
+	case 2:
+		err := c.Enable(false)
+		if err != nil {
+			c.log.ERROR.Printf("%s: Failed to disable miner during stepped shutdown: %v", c.hardware.Name, err)
+			return
+		}
+
+		c.mu.Lock()
+		c.intelligentDecrease.LowPowerStart = time.Time{}
+		c.intelligentDecrease.LastDecreaseStep = time.Time{}
+		c.mu.Unlock()
+	}
+}
+
 func (c *BraiinsOS) Status() (api.ChargeStatus, error) {
 	if resetStatus := c.checkDailyReset(); resetStatus != api.StatusNone {
 		return resetStatus, nil
 	}
 
+	c.mu.Lock()
+	isPausing := c.powerState.IsPausing
+	pausedByTimer := c.powerState.PausedByTimer
+	c.mu.Unlock()
+
+	if isPausing || pausedByTimer {
+		c.log.DEBUG.Printf("%s: Grace period or paused by timer - returning StatusB",
+			c.hardware.Name)
+		return api.StatusB, nil
+	}
+
 	status, err := c.getMinerStatus()
 	if err != nil {
 		return api.StatusNone, err
+	}
+
+	if c.lp != nil {
+		c.mu.Lock()
+		c.currentMode = c.lp.GetMode()
+		c.mu.Unlock()
+	}
+
+	if c.lp != nil {
+		c.handleModeSpecificBehavior()
 	}
 
 	if c.lp != nil && c.lp.GetMode() == api.ModeOff {
@@ -1326,7 +1322,6 @@ func (c *BraiinsOS) Status() (api.ChargeStatus, error) {
 	return c.mapMinerStatusToChargeStatus(status), nil
 }
 
-// mapMinerStatusToChargeStatus maps miner status to charge status
 func (c *BraiinsOS) mapMinerStatusToChargeStatus(status int) api.ChargeStatus {
 	switch status {
 	case MinerStatusMining:
@@ -1344,8 +1339,16 @@ func (c *BraiinsOS) mapMinerStatusToChargeStatus(status int) api.ChargeStatus {
 	}
 }
 
-// Enabled returns whether the miner is enabled
 func (c *BraiinsOS) Enabled() (bool, error) {
+	c.mu.Lock()
+	isPausing := c.powerState.IsPausing
+	pausedByTimer := c.powerState.PausedByTimer
+	c.mu.Unlock()
+
+	if isPausing || pausedByTimer {
+		return false, nil
+	}
+
 	status, err := c.getMinerStatus()
 	if err != nil {
 		return false, err
@@ -1353,30 +1356,87 @@ func (c *BraiinsOS) Enabled() (bool, error) {
 	return status == MinerStatusMining || status == MinerStatusDegraded, nil
 }
 
-// Enable enables or disables the miner
 func (c *BraiinsOS) Enable(enable bool) error {
 	endpoint, operation := c.getEnableEndpoint(enable)
 
+	if !enable {
+		c.mu.Lock()
+		if !c.powerState.IsPausing {
+			c.powerState.IsPausing = true
+			c.powerState.PauseStarted = time.Now()
+			c.log.DEBUG.Printf("%s: Starting grace period", c.hardware.Name)
+		} else {
+			c.log.DEBUG.Printf("%s: Grace period already active - skipping redundant set", c.hardware.Name)
+		}
+		c.mu.Unlock()
+
+		c.log.DEBUG.Printf("%s: Sending pause command", c.hardware.Name)
+	} else {
+		c.mu.Lock()
+		pausedByTimer := c.powerState.PausedByTimer
+		isInPVMode := c.currentMode == api.ModePV
+		c.mu.Unlock()
+
+		if pausedByTimer && isInPVMode {
+			c.log.DEBUG.Printf("%s: Miner paused by intelligent decrease timer (PV mode) - NOT resuming despite evcc request",
+				c.hardware.Name)
+			return nil
+		}
+
+		if pausedByTimer && !isInPVMode {
+			c.mu.Lock()
+			c.powerState.PausedByTimer = false
+			c.log.INFO.Printf("%s: Mode switched from PV to %s - clearing pausedByTimer, miner can resume",
+				c.hardware.Name, c.currentMode)
+			c.mu.Unlock()
+		}
+
+		c.mu.Lock()
+		if c.powerState.IsPausing {
+			c.powerState.IsPausing = false
+			c.log.DEBUG.Printf("%s: Resume called during grace period - cancelling pause state", c.hardware.Name)
+		}
+		c.mu.Unlock()
+	}
+
 	resp, err := c.authRequest(http.MethodPut, endpoint, nil)
 	if err != nil {
+		if !enable {
+			c.mu.Lock()
+			c.powerState.IsPausing = false
+			c.mu.Unlock()
+		}
 		return err
 	}
 	defer c.closeResponseBody(resp)
 
 	if err := c.handleHTTPResponse(resp, operation); err != nil {
+		if !enable {
+			c.mu.Lock()
+			c.powerState.IsPausing = false
+			c.mu.Unlock()
+		}
 		return err
 	}
 
 	if !enable {
 		c.resetDecreaseTracking()
-		c.log.DEBUG.Printf("%s: Intelligent decrease timers reset (miner paused)", c.hardware.Name)
+
+		go func() {
+			time.Sleep(60 * time.Second)
+			c.mu.Lock()
+			defer c.mu.Unlock()
+			if c.powerState.IsPausing {
+				c.powerState.IsPausing = false
+				c.log.DEBUG.Printf("%s: Grace period ended (60s), resuming normal power readings", c.hardware.Name)
+			}
+		}()
 	}
 
 	c.log.DEBUG.Printf("%s: Miner %s successful", c.hardware.Name, operation)
 	return nil
 }
 
-// getEnableEndpoint returns the appropriate endpoint for enable/disable
 func (c *BraiinsOS) getEnableEndpoint(enable bool) (string, string) {
 	if enable {
 		return apiPathResume, "resume"
@@ -1384,25 +1444,25 @@ func (c *BraiinsOS) getEnableEndpoint(enable bool) (string, string) {
 	return apiPathPause, "pause"
 }
 
-// MaxCurrent sets the maximum current (int64 version)
 func (c *BraiinsOS) MaxCurrent(current int64) error {
 	return c.MaxCurrentMillis(float64(current))
 }
 
-// MaxCurrentMillis sets the maximum current with float precision
 func (c *BraiinsOS) MaxCurrentMillis(current float64) error {
+	c.log.DEBUG.Printf("%s: MaxCurrentMillis called: %.2fA (%.0fW)",
+		c.hardware.Name, current, current*c.config.Voltage)
+
 	if current < 0 {
 		return fmt.Errorf("invalid negative current value: %.2f", current)
 	}
 
 	if current == 0 {
+		c.log.DEBUG.Printf("%s: current=0 → calling Enable(false)", c.hardware.Name)
 		return c.Enable(false)
 	}
 
-	// Store ORIGINAL request BEFORE clipping (for timer)
 	originalPowerRequest := current * c.config.Voltage
 
-	// Ensure minimum current (clipping for miner)
 	minCurrent := c.getMinCurrent()
 	minPower := minCurrent * c.config.Voltage
 	wasClipped := false
@@ -1415,108 +1475,142 @@ func (c *BraiinsOS) MaxCurrentMillis(current float64) error {
 
 	clippedPowerRequest := current * c.config.Voltage
 
+	var targetPowerInt int
+	var powerChanged bool
+	var doEnableFalse bool
+	var doSetPower bool
+	var decreaseHandled bool
+
 	c.mu.Lock()
 	currentTarget := c.powerState.LastTarget
+	isFromDiscovery := c.powerState.IsFromDiscovery
+	isInPVMode := c.currentMode == api.ModePV
 	c.mu.Unlock()
 
-	// Handle power changes
-	if originalPowerRequest < float64(currentTarget) {
-		// Pass BOTH: original (for timer) and clipped (for miner)
-		newPowerRequest, err := c.handlePowerDecrease(originalPowerRequest, clippedPowerRequest, currentTarget, wasClipped)
+	if originalPowerRequest < float64(currentTarget) && isInPVMode {
+		c.mu.Lock()
+		if c.intelligentDecrease.LowPowerStart.IsZero() {
+			c.intelligentDecrease.LowPowerStart = time.Now()
+		}
+		c.mu.Unlock()
+
+		newTargetInt, err := c.handlePowerDecrease(originalPowerRequest, currentTarget, wasClipped)
 		if err != nil {
 			return err
 		}
-		// If return is 0, turn off miner
-		if newPowerRequest == 0 {
-			c.log.INFO.Printf("%s: Insufficient solar power - turning off miner", c.hardware.Name)
-			return c.Enable(false)
+
+		// CRITICAL FIX v0.4.35: Use the DPS-aligned result from handlePowerDecrease directly
+		if newTargetInt == 0 {
+			doEnableFalse = true
+			c.mu.Lock()
+			c.powerState.PausedByTimer = true
+			c.log.INFO.Printf("%s: Miner paused due to insufficient solar power - remains off until sufficient power returns",
+				c.hardware.Name)
+			c.mu.Unlock()
+		} else if newTargetInt != currentTarget {
+			// handlePowerDecrease returned a new target - use it directly (already DPS-aligned)
+			targetPowerInt = newTargetInt
+			powerChanged = true
+			decreaseHandled = true
+			c.log.DEBUG.Printf("%s: Using DPS-aligned target from handlePowerDecrease: %dW",
+				c.hardware.Name, targetPowerInt)
+		} else {
+			// No change from handlePowerDecrease - keep current target
+			targetPowerInt = currentTarget
+			powerChanged = false
+			decreaseHandled = true
 		}
-		if newPowerRequest == clippedPowerRequest {
-			c.log.DEBUG.Printf("%s: Power unchanged at %.0fW (waiting for timer or maintaining target)",
-				c.hardware.Name, clippedPowerRequest)
-			return nil // No change needed
-		}
-		clippedPowerRequest = newPowerRequest
 	} else {
-		// Power increase - reset decrease tracking
 		c.resetDecreaseTracking()
 	}
 
-	// Use clipped request for actual power setting
-	powerRequest := clippedPowerRequest
-
-	// If power target not enabled, use on/off control
 	if !c.powerState.Enabled {
 		return c.handleOnOffControl()
 	}
 
-	// Calculate target power
-	c.mu.Lock()
-	isIncreasing := powerRequest > float64(c.powerState.LastTarget)
-	c.mu.Unlock()
+	// Only calculate target power if decrease was NOT handled
+	if !decreaseHandled {
+		powerRequest := clippedPowerRequest
+		isIncreasing := powerRequest > float64(currentTarget)
+		targetPowerInt = c.calculateTargetPower(powerRequest, isIncreasing)
+		powerChanged = targetPowerInt != currentTarget
+	}
 
-	targetPowerInt := c.calculateTargetPower(powerRequest, isIncreasing)
-
-	// Check if power changed
-	c.mu.Lock()
-	powerChanged := targetPowerInt != c.powerState.LastTarget
-	c.mu.Unlock()
+	if isFromDiscovery {
+		c.log.DEBUG.Printf("%s: First call after discovery (target: %dW) - forcing setPowerTarget()",
+			c.hardware.Name, targetPowerInt)
+		powerChanged = true
+	}
 
 	if !powerChanged {
+		c.log.DEBUG.Printf("%s: Power unchanged at %dW (requested: %.0fW, original: %.0fW) → no action",
+			c.hardware.Name, targetPowerInt, clippedPowerRequest, originalPowerRequest)
 		return nil
 	}
 
-	// Wait if needed for power increase
-	if isIncreasing {
-		c.waitForPowerIncreaseInterval()
+	doSetPower = true
+
+	if doEnableFalse {
+		c.log.INFO.Printf("%s: Insufficient solar power - turning off miner", c.hardware.Name)
+		return c.Enable(false)
 	}
 
-	// Set new power target
-	if err := c.setPowerTarget(targetPowerInt); err != nil {
+	if doSetPower {
+		if err := c.setPowerTarget(targetPowerInt); err != nil {
+			return err
+		}
+	}
+
+	if err := c.ensureMinerEnabled(); err != nil {
 		return err
 	}
 
-	// Ensure miner is enabled
-	return c.ensureMinerEnabled()
+	effectiveMin := c.getEffectiveMinWatts()
+	if targetPowerInt > effectiveMin {
+		c.mu.Lock()
+		if c.powerState.PausedByTimer {
+			c.powerState.PausedByTimer = false
+			c.log.INFO.Printf("%s: Sufficient solar power returned and power set - clearing pausedByTimer flag (target: %dW > min: %dW)",
+				c.hardware.Name, targetPowerInt, effectiveMin)
+		}
+		c.mu.Unlock()
+	}
+
+	return nil
 }
 
-// handleOnOffControl handles miner control when power target is not available
 func (c *BraiinsOS) handleOnOffControl() error {
 	if !c.powerState.WarningShown {
 		c.log.INFO.Printf("%s: Using on/off control (PowerTarget not available)", c.hardware.Name)
 		c.powerState.WarningShown = true
 	}
-
 	enabled, err := c.Enabled()
 	if err != nil {
 		return err
 	}
-
 	if !enabled {
 		return c.Enable(true)
 	}
-
 	return nil
 }
 
-// waitForPowerIncreaseInterval waits before allowing power increase
-func (c *BraiinsOS) waitForPowerIncreaseInterval() {
+func (c *BraiinsOS) ensureMinerEnabled() error {
 	c.mu.Lock()
-	timeSinceLastUpdate := time.Since(c.powerState.LastUpdate)
-	shouldWait := c.config.PowerTargetInterval > minIntervalForWait &&
-		timeSinceLastUpdate < c.config.PowerTargetInterval
+	isPausing := c.powerState.IsPausing
+	pausedByTimer := c.powerState.PausedByTimer
 	c.mu.Unlock()
 
-	if shouldWait {
-		waitTime := c.config.PowerTargetInterval - timeSinceLastUpdate
-		c.log.DEBUG.Printf("%s: Waiting %v before power increase",
-			c.hardware.Name, waitTime.Round(time.Second))
-		time.Sleep(waitTime)
+	if pausedByTimer {
+		c.log.DEBUG.Printf("%s: Miner paused by intelligent decrease timer - keeping off",
+			c.hardware.Name)
+		return nil
 	}
-}
 
-// ensureMinerEnabled ensures miner is enabled
-func (c *BraiinsOS) ensureMinerEnabled() error {
+	if isPausing {
+		c.log.DEBUG.Printf("%s: Miner in pause grace period - skipping enable check", c.hardware.Name)
+		return nil
+	}
+
 	enabled, err := c.Enabled()
 	if err != nil {
 		return err
@@ -1529,13 +1623,12 @@ func (c *BraiinsOS) ensureMinerEnabled() error {
 	return nil
 }
 
-// LoadpointControl registers loadpoint controller interface
 func (c *BraiinsOS) LoadpointControl(lp loadpoint.API) {
 	c.lp = lp
-	c.log.DEBUG.Printf("%s: LoadpointController interface connected", c.hardware.Name)
+	c.currentMode = lp.GetMode()
+	c.log.DEBUG.Printf("%s: LoadpointController interface connected (mode: %s)", c.hardware.Name, c.currentMode)
 }
 
-// Verify interface implementations
 var _ api.Charger = (*BraiinsOS)(nil)
 var _ api.ChargerEx = (*BraiinsOS)(nil)
 var _ api.Meter = (*BraiinsOS)(nil)

@@ -36,17 +36,6 @@ params:
     type: int
     default: 0
 
-  - name: voltage
-    description:
-      de: Netzspannung in Volt
-      en: Grid voltage in volts
-    help:
-      de: Europa/Asien/Australien=230V, USA/Kanada=120V, Japan=100V
-      en: Europe/Asia/Australia=230V, USA/Canada=120V, Japan=100V
-    type: float
-    default: 230
-    advanced: true
-
   - name: dailyReset
     description:
       de: Täglicher Session-Reset
@@ -66,28 +55,6 @@ params:
       en: Waits on lower power and decreases gradually (prevents long DPS recovery)
     type: bool
     default: true
-
-  - name: powerTargetInterval
-    description:
-      de: Intervall zwischen Leistungserhöhungen
-      en: Interval between power increases
-    help:
-      de: Wartezeit zwischen Hochregeln-Schritten
-      en: Wait time between power increase steps
-    type: duration
-    default: 15s
-    advanced: true
-
-  - name: powerTargetStep
-    description:
-      de: Leistungsschritte in Watt
-      en: Power stepping in watts
-    help:
-      de: Granularität der Leistungsanpassung (100-300W empfohlen)
-      en: Power adjustment granularity (100-300W recommended)
-    type: int
-    default: 100
-    advanced: true
 
   - name: minDecreaseDuration
     description:
@@ -111,6 +78,17 @@ params:
     default: 5m
     advanced: true
 
+  - name: powerTargetStep
+    description:
+      de: Leistungs-Schrittweite
+      en: Power step size
+    help:
+      de: Schrittweite in Watt für Leistungsänderungen (sollte zu DPS-Einstellung passen)
+      en: Step size in watts for power changes (should match DPS setting)
+    type: int
+    default: 300
+    advanced: true
+
 render: |
   type: braiins
   uri: {{ .uri }}
@@ -119,24 +97,18 @@ render: |
   {{- if .maxPower }}
   maxPower: {{ .maxPower }}
   {{- end }}
-  {{- if ne (atoi .voltage) 230 }}
-  voltage: {{ .voltage }}
-  {{- end }}
   {{- if .dailyReset }}
   dailyReset: {{ .dailyReset }}
   {{- end }}
   {{- if .intelligentDecrease }}
   intelligentDecrease: {{ .intelligentDecrease }}
   {{- end }}
-  {{- if ne .powerTargetInterval "15s" }}
-  powerTargetInterval: {{ .powerTargetInterval }}
-  {{- end }}
-  {{- if .powerTargetStep }}
-  powerTargetStep: {{ .powerTargetStep }}
-  {{- end }}
   {{- if ne .minDecreaseDuration "15m" }}
   minDecreaseDuration: {{ .minDecreaseDuration }}
   {{- end }}
   {{- if ne .decreaseStepInterval "5m" }}
   decreaseStepInterval: {{ .decreaseStepInterval }}
+  {{- end }}
+  {{- if ne .powerTargetStep "300" }}
+  powerTargetStep: {{ .powerTargetStep }}
   {{- end }}
